@@ -704,6 +704,20 @@ impl SftpEntry {
             return Err(err);
         }
 
+        // فایل local وسط آپلود truncate شده باشه، EOF زودرس می‌آد.
+        // حتماً قبل از promote چک کن — وگرنه مقصد قدیمی رو با فایل ناقص عوض می‌کنیم
+        // و بعد error می‌دیم (یعنی دیتای ریموت از بین رفته).
+        if !should_promote_upload(total_bytes, bytes_transferred) {
+            if using_temp {
+                let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
+                clear_upload_marker(local_path);
+            }
+            return Err(format!(
+                "incomplete upload: wrote {} of {} bytes",
+                bytes_transferred, total_bytes
+            ));
+        }
+
         if using_temp {
             // حالا که فایل کامل تو temp هست، مقصد قدیمی رو بردار و atomic-ish جایگزین کن
             if remote_len.is_some() {
@@ -721,14 +735,6 @@ impl SftpEntry {
                     remote_tmp, remote_path, e
                 )
             })?;
-        }
-
-        // فایل local وسط آپلود truncate شده باشه، EOF زودرس می‌آد — موفقیت دروغین نده.
-        if total_bytes > 0 && bytes_transferred != total_bytes {
-            return Err(format!(
-                "incomplete upload: wrote {} of {} bytes",
-                bytes_transferred, total_bytes
-            ));
         }
 
         clear_upload_marker(local_path);
@@ -943,12 +949,14 @@ impl SftpEntry {
                 .and_then(|n| n.to_str())
                 .unwrap_or("file"),
         );
+        // session_id از host id میاد و ممکنه با sync دستکاری بشه؛ تو مسیر temp نذار خام بمونه
+        let safe_session = sanitize_temp_path_component(session_id);
 
         let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let rand_id = &rand_id[..8];
         let app_temp_dir = std::env::temp_dir()
             .join("termifai")
-            .join(format!("{}_{}", session_id, rand_id));
+            .join(format!("{}_{}", safe_session, rand_id));
         std::fs::create_dir_all(&app_temp_dir)
             .map_err(|e| format!("Create temp dir failed: {}", e))?;
         let tmp_path = app_temp_dir.join(&file_name);
@@ -1314,8 +1322,11 @@ impl SftpEntry {
                     });
                     continue;
                 }
+                // مثل مسیر تک‌فایل: مقصد لوکال رو اینجا پاک نکن.
+                // download_file اول تو tmp می‌نویسه و فقط بعد از موفقیت جایگزین می‌کنه؛
+                // پاک کردن زودهنگام یعنی اگه ترنسفر بترکه دیتای قبلی از بین رفته.
+                // اگه tmp قابل resume خودمون نیست، marker/tmp کهنه رو پاک کن تا از صفر بره.
                 if !has_our_tmp {
-                    let _ = std::fs::remove_file(lp);
                     clear_download_resume_files(&lp_str);
                 }
             }
@@ -1368,6 +1379,28 @@ fn pathbase(path: &str) -> String {
         .find(|s| !s.is_empty())
         .unwrap_or("file")
         .to_string()
+}
+
+/// قبل از promote آپلود: بایت نوشته‌شده باید با size اولیه یکی باشه.
+/// total=0 (فایل خالی) استثناست — همون رفتار قبلی.
+fn should_promote_upload(total_bytes: u64, bytes_transferred: u64) -> bool {
+    total_bytes == 0 || bytes_transferred == total_bytes
+}
+
+/// کامپوننت مسیر temp (مثل session_id) رو از متاکاراکترهای cmd و جداکننده‌ها پاک می‌کنه.
+fn sanitize_temp_path_component(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().max(1));
+    for ch in name.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' => out.push(ch),
+            _ => out.push('_'),
+        }
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        "session".to_string()
+    } else {
+        out
+    }
 }
 
 /// اسم فایل temp برای Open remote رو از path traversal و متاکاراکترهای
@@ -1816,6 +1849,29 @@ mod tests {
     fn sanitize_open_basename_keeps_safe_unicode_names() {
         assert_eq!(sanitize_open_basename("گزارش.pdf"), "گزارش.pdf");
         assert_eq!(sanitize_open_basename("notes (1).md"), "notes (1).md");
+    }
+
+    #[test]
+    fn sanitize_temp_path_component_strips_cmd_metacharacters() {
+        assert_eq!(
+            sanitize_temp_path_component("host-&calc.exe&"),
+            "host-_calc.exe_"
+        );
+        assert_eq!(sanitize_temp_path_component("a|b<script>"), "a_b_script_");
+        assert_eq!(sanitize_temp_path_component("sftp-abc_123"), "sftp-abc_123");
+        assert_eq!(sanitize_temp_path_component(".."), "session");
+        assert_eq!(sanitize_temp_path_component(""), "session");
+    }
+
+    #[test]
+    fn incomplete_upload_must_block_before_promote() {
+        // قرارداد: اگه بایت‌های نوشته‌شده با size اولیه یکی نباشه،
+        // نباید temp رو روی مقصد promote کنیم (وگرنه دیتای ریموت می‌سوزه).
+        assert!(should_promote_upload(100, 100));
+        assert!(!should_promote_upload(100, 40));
+        assert!(!should_promote_upload(100, 0));
+        // فایل خالی: total=0، promote/OK مجاز هست
+        assert!(should_promote_upload(0, 0));
     }
 }
 

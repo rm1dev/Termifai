@@ -1597,15 +1597,14 @@ async fn sftp_open_remote(
                 Ok(v) => {
                     // open succeeded — skip retry path
                     drop(guard);
-                    // open local app
+                    // open local app — روی ویندوز حتماً ShellExecute، نه cmd /c start
+                    // (مسیر temp می‌تونه از session_id دستکاری‌شده بیاد)
                     #[cfg(target_os = "macos")]
                     let _ = std::process::Command::new("open").arg(&v).spawn();
                     #[cfg(target_os = "linux")]
                     let _ = std::process::Command::new("xdg-open").arg(&v).spawn();
                     #[cfg(target_os = "windows")]
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/c", "start", "", &v])
-                        .spawn();
+                    windows_shell_open(&v, None)?;
                     return Ok(v);
                 }
                 Err(e) => e,
