@@ -102,6 +102,7 @@ fn delete_script_file(dir: &std::path::Path, id: &str) {
 /// fields for vault storage. Returns the set of script ids that must stay on
 /// disk after the vault commit succeeds. Does **not** delete anything — orphans
 /// are purged only after metadata is durable (see [`apply_synced_snippets`]).
+#[cfg(test)]
 fn write_synced_script_bodies(
     dir: &std::path::Path,
     snippets: Vec<Snippet>,
@@ -147,29 +148,86 @@ fn purge_orphan_script_files(
     }
 }
 
-/// Applies a merged snippet set from sync: writes/updates `.sh` files for
-/// Script snippets, commits vault metadata, then drops orphaned script files.
+/// Applies a merged snippet set from sync: LWW-merges vault metadata with the
+/// live store under lock (so a concurrent `save_snippet` is not clobbered),
+/// writes winning `.sh` bodies, then drops orphaned script files.
 /// Orphan deletes happen **after** a successful vault write so a failed sync
 /// apply cannot wipe script bodies while the local vault still references them.
 pub fn apply_synced_snippets(
     app: &AppHandle,
     snippets: Vec<Snippet>,
     groups: Vec<SnippetGroup>,
+    tombstones: Vec<crate::tombstones::Tombstone>,
 ) -> Result<(), String> {
     let dir = get_snippets_dir(app)?;
-    let (mut vault_snippets, keep_script_ids) = write_synced_script_bodies(&dir, snippets)?;
+    for snippet in &snippets {
+        validate_snippet_id(&snippet.id)?;
+    }
 
-    // اگه گروهی tombstone شده ولی snippet هنوز group_id داره، بیارش به root
-    clear_orphan_group_ids(&mut vault_snippets, &groups);
+    // Keep inline script bodies on the incoming set for LWW — do not write
+    // `.sh` files yet or a concurrent local edit's file would be overwritten
+    // before merge can prefer it.
+    let mut incoming_snippets = snippets;
+    clear_orphan_group_ids(&mut incoming_snippets, &groups);
 
+    // Prefer live local on equal timestamps (local_device_id >= remote_device_id).
+    const APPLY_LOCAL: &str = "apply-local";
+    const APPLY_OUTCOME: &str = "apply-from-sync";
     let state = app.state::<AppState>();
+    let mut keep_script_ids = std::collections::HashSet::new();
+    let mut pending_writes: Vec<(String, String)> = Vec::new();
     state
         .snippets_store
         .update_with_migration(migrate_snippets_vault, |vault| {
-            vault.snippets = vault_snippets.clone();
-            vault.groups = groups.clone();
+            let live_snippets = std::mem::take(&mut vault.snippets);
+            let live_groups = std::mem::take(&mut vault.groups);
+            let live_with_scripts: Vec<Snippet> = live_snippets
+                .into_iter()
+                .map(|mut s| {
+                    if matches!(s.kind, SnippetKind::Script) {
+                        if let Some(content) = read_script_file(&dir, &s.id) {
+                            s.script = Some(content);
+                        }
+                    }
+                    s
+                })
+                .collect();
+            let mut merged_snippets = termifai_core::sync::merge::merge_entities(
+                live_with_scripts,
+                incoming_snippets.clone(),
+                &tombstones,
+                crate::tombstones::EntityKind::Snippet,
+                APPLY_LOCAL,
+                APPLY_OUTCOME,
+            );
+            let merged_groups = termifai_core::sync::merge::merge_entities(
+                live_groups,
+                groups.clone(),
+                &tombstones,
+                crate::tombstones::EntityKind::SnippetGroup,
+                APPLY_LOCAL,
+                APPLY_OUTCOME,
+            );
+            clear_orphan_group_ids(&mut merged_snippets, &merged_groups);
+
+            for snippet in &mut merged_snippets {
+                if matches!(snippet.kind, SnippetKind::Script) {
+                    keep_script_ids.insert(snippet.id.clone());
+                    if let Some(content) = snippet.script.take() {
+                        pending_writes.push((snippet.id.clone(), content));
+                    }
+                }
+                snippet.script = None;
+            }
+
+            vault.snippets = merged_snippets;
+            vault.groups = merged_groups;
         })
         .map_err(|e| e.to_string())?;
+
+    for (id, content) in &pending_writes {
+        write_script_file(&dir, id, content)?;
+    }
 
     // فقط بعد از commit موفق پاک می‌کنیم — وگرنه با failure، دیتای لوکال می‌پره
     purge_orphan_script_files(&dir, &keep_script_ids);
