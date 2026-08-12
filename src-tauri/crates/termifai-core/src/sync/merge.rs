@@ -208,6 +208,55 @@ mod tests {
     }
 
     #[test]
+    fn apply_merge_prefers_live_local_on_equal_timestamp() {
+        // apply_outcome uses device ids where local >= outcome lexicographically
+        // ("apply-local" >= "apply-from-sync") so a concurrent save with the
+        // same updated_at is not clobbered.
+        let local = vec![group("g1", "2026-01-01T00:00:00Z")];
+        let mut remote = group("g1", "2026-01-01T00:00:00Z");
+        remote.name = "from-sync".to_string();
+        let merged = merge_entities(
+            local,
+            vec![remote],
+            &[],
+            EntityKind::Group,
+            "apply-local",
+            "apply-from-sync",
+        );
+        assert_eq!(merged[0].name, "g1", "live local must win equal-timestamp ties");
+    }
+
+    #[test]
+    fn ssh_key_equal_created_at_prefers_local_none_over_remote_pem() {
+        // Documents the gather hazard fixed in sync.rs: if local PEM read fails
+        // (.ok() -> None) while created_at ties, LWW+equal device_id uploads None
+        // over remote Some and wipes the sync backup.
+        fn key(id: &str, pem: Option<&str>) -> SshKey {
+            SshKey {
+                id: id.to_string(),
+                name: id.to_string(),
+                key_type: crate::model::ssh_keys::SshKeyType::Ed25519,
+                size: None,
+                fingerprint: "fp".to_string(),
+                remark: None,
+                has_passphrase: false,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                public_key: "ssh-ed25519 AAAA".to_string(),
+                public_key_path: "/tmp/k.pub".to_string(),
+                private_key_path: "/tmp/k".to_string(),
+                private_key_pem: pem.map(|s| s.to_string()),
+            }
+        }
+        let local = vec![key("k1", None)];
+        let remote = vec![key("k1", Some("BEGIN"))];
+        let merged = merge_entities(local, remote, &[], EntityKind::SshKey, "dev-a", "dev-a");
+        assert!(
+            merged[0].private_key_pem.is_none(),
+            "equal device ids prefer local — missing PEM would wipe remote backup"
+        );
+    }
+
+    #[test]
     fn newer_updated_at_wins() {
         let local = vec![group("g1", "2026-01-01T00:00:00Z")];
         let remote = vec![group("g1", "2026-02-01T00:00:00Z")];
