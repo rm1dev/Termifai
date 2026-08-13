@@ -129,6 +129,9 @@ fn create_session(
             .iter()
             .find(|h| h.id == *h_id)
             .ok_or_else(|| "Host not found".to_string())?;
+        // Defense in depth: refuse to spawn a terminal for a vault/sync'd host
+        // whose identity would be parsed as OpenSSH options (leading `-`, etc.).
+        hosts::validate_ssh_cli_identity(host.user.trim(), host.hostname.trim())?;
         hosts::decrypt_host_password(host)
     } else {
         None

@@ -14,3 +14,12 @@ export function posixShellQuote(value: string): string {
 export function quotePathForShell(path: string): string {
   return platform === "windows" ? `"${path}"` : posixShellQuote(path);
 }
+
+/**
+ * OpenSSH destination segment for a locally-spawned `ssh` command line.
+ * Always includes `--` so a leading-dash username (e.g. `-oProxyCommand=…`)
+ * cannot be parsed as an OpenSSH option — shell quoting alone does not stop that.
+ */
+export function sshCliDestination(user: string, hostname: string): string {
+  return `-- ${posixShellQuote(`${user}@${hostname}`)}`;
+}

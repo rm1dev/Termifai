@@ -1118,7 +1118,11 @@ fn apply_outcome(
     sync_ssh_keys: bool,
 ) -> Result<(), String> {
     let existing_hosts = crate::hosts::list_hosts(app)?.hosts;
-    let mut hosts = outcome.hosts.clone();
+    // Drop (or refuse to overwrite with) hosts whose user/hostname would inject
+    // OpenSSH CLI options. Save-time validation already rejects these, but sync
+    // can still deliver them from another device / a poisoned sync folder.
+    let mut hosts =
+        crate::hosts::filter_synced_ssh_hosts(&outcome.hosts, &existing_hosts);
     for host in hosts.iter_mut() {
         if let Some(plaintext) = host.password.take() {
             if plaintext.is_empty() {

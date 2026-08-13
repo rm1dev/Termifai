@@ -668,6 +668,31 @@ pub(crate) fn push_ssh_cli_destination(
     command.arg(format!("{user}@{hostname}"));
 }
 
+/// Keep only hosts whose SSH identity is safe to pass to the system `ssh`
+/// binary. When an incoming sync record fails validation, prefer the existing
+/// local copy (if that copy is itself valid) over installing an injection
+/// payload; otherwise drop the host.
+pub(crate) fn filter_synced_ssh_hosts(incoming: &[Host], existing: &[Host]) -> Vec<Host> {
+    incoming
+        .iter()
+        .filter_map(|host| {
+            if validate_ssh_cli_identity(host.user.trim(), host.hostname.trim()).is_ok() {
+                return Some(host.clone());
+            }
+            existing.iter().find_map(|prior| {
+                if prior.id != host.id {
+                    return None;
+                }
+                if validate_ssh_cli_identity(prior.user.trim(), prior.hostname.trim()).is_ok() {
+                    Some(prior.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
 fn validate_group_exists(vault: &HostsVault, group_id: Option<&str>) -> Result<(), String> {
     if let Some(group_id) = group_id {
         if !vault.groups.iter().any(|group| group.id == group_id) {
@@ -852,5 +877,63 @@ mod tests {
         assert!(validate_ssh_cli_identity("user", "host name").is_err());
         assert!(validate_ssh_cli_identity("ubuntu", "example.com").is_ok());
         assert!(validate_ssh_cli_identity("ubuntu", "127.0.0.1").is_ok());
+    }
+
+    fn sample_host(id: &str, user: &str, hostname: &str) -> Host {
+        Host {
+            id: id.into(),
+            name: id.into(),
+            user: user.into(),
+            hostname: hostname.into(),
+            port: 22,
+            os: OsKind::Other,
+            tags: vec![],
+            last_used: None,
+            group_id: None,
+            auth_method: None,
+            password: None,
+            ssh_key_id: None,
+            show_status_in_dashboard: None,
+            working_directory: None,
+            default_sftp_path: None,
+            updated_at: None,
+            sync_server: None,
+            resilient_session: None,
+        }
+    }
+
+    #[test]
+    fn filter_synced_ssh_hosts_drops_option_injection_payload() {
+        let incoming = vec![sample_host(
+            "h1",
+            "-oProxyCommand=touch /tmp/pwned",
+            "127.0.0.1",
+        )];
+        let kept = filter_synced_ssh_hosts(&incoming, &[]);
+        assert!(
+            kept.is_empty(),
+            "injection username must not be installed via sync"
+        );
+    }
+
+    #[test]
+    fn filter_synced_ssh_hosts_keeps_prior_when_incoming_is_malicious() {
+        let existing = vec![sample_host("h1", "ubuntu", "example.com")];
+        let incoming = vec![sample_host(
+            "h1",
+            "-oProxyCommand=touch /tmp/pwned",
+            "example.com",
+        )];
+        let kept = filter_synced_ssh_hosts(&incoming, &existing);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].user, "ubuntu");
+    }
+
+    #[test]
+    fn filter_synced_ssh_hosts_keeps_valid_incoming() {
+        let incoming = vec![sample_host("h1", "ubuntu", "example.com")];
+        let kept = filter_synced_ssh_hosts(&incoming, &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].user, "ubuntu");
     }
 }
