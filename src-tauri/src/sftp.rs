@@ -1,8 +1,8 @@
 use crate::sftp_transfer::{
     clear_download_resume_files, clear_upload_marker, download_marker_matches,
-    download_resume_offset_verified, download_tmp_path, same_file_identity, upload_marker_matches,
-    upload_resume_offset_verified, write_download_marker, write_upload_marker, DownloadMarker,
-    UploadMarker,
+    download_resume_offset_verified, download_tmp_path, plan_upload_temp, same_file_identity,
+    upload_marker_matches, upload_temp_is_our_partial, write_download_marker, write_upload_marker,
+    DownloadMarker, UploadMarker, UploadTempPlan,
 };
 use crate::ssh;
 use serde::{Deserialize, Serialize};
@@ -586,16 +586,19 @@ impl SftpEntry {
         let total_bytes = local_meta.len();
         let local_mtime = local_mtime_secs(&local_meta);
 
-        let remote_len = sftp
-            .stat(std::path::Path::new(remote_path))
-            .ok()
-            .and_then(|s| s.size);
+        let dest_exists = sftp.stat(std::path::Path::new(remote_path)).is_ok();
 
         let identity_ok = upload_marker_matches(local_path, remote_path, total_bytes, local_mtime);
-        let resume_at =
-            upload_resume_offset_verified(remote_len, total_bytes, identity_ok).unwrap_or(0);
+        // همیشه روی sidecar می‌نویسیم؛ resume فقط از روی سایز temp — نه مقصد قدیمی.
+        let remote_tmp = format!("{}.termifai-uploading", remote_path);
+        let tmp_len = sftp
+            .stat(std::path::Path::new(&remote_tmp))
+            .ok()
+            .and_then(|s| s.size);
+        let plan = plan_upload_temp(identity_ok, tmp_len, total_bytes);
 
-        if resume_at == total_bytes && total_bytes > 0 {
+        if matches!(plan, UploadTempPlan::PromoteComplete) {
+            promote_upload_temp(&sftp, remote_path, &remote_tmp, dest_exists)?;
             clear_upload_marker(local_path);
             on_progress(TransferProgress {
                 session_id: session_id.to_string(),
@@ -609,30 +612,33 @@ impl SftpEntry {
         let mut local_file =
             std::fs::File::open(local_path).map_err(|e| format!("open local: {}", e))?;
 
-        // آپلود تازه (غیر resume) اول می‌ره تو فایل موقت تا مقصد قبلی از بین نره
-        let remote_tmp = format!("{}.termifai-uploading", remote_path);
-        let using_temp = resume_at == 0;
+        let (resume_at, started_fresh) = match plan {
+            UploadTempPlan::ResumeTemp { offset } => (offset, false),
+            UploadTempPlan::FreshTemp => {
+                let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
+                clear_upload_marker(local_path);
+                (0, true)
+            }
+            UploadTempPlan::PromoteComplete => unreachable!("handled above"),
+        };
 
         let mut remote_file = if resume_at > 0 {
-            // فقط WRITE + seek — APPEND روی OpenSSH با O_APPEND ممکنه seek رو نادیده بگیره
+            // فقط WRITE + seek روی temp — مقصد نهایی رو دست نزن
             let mut f = sftp
                 .open_mode(
-                    std::path::Path::new(remote_path),
+                    std::path::Path::new(&remote_tmp),
                     OpenFlags::WRITE,
                     0o644,
                     OpenType::File,
                 )
-                .map_err(|e| format!("open remote for resume '{}': {}", remote_path, e))?;
+                .map_err(|e| format!("open remote temp for resume '{}': {}", remote_tmp, e))?;
             f.seek(SeekFrom::Start(resume_at))
-                .map_err(|e| format!("seek remote: {}", e))?;
+                .map_err(|e| format!("seek remote temp: {}", e))?;
             local_file
                 .seek(SeekFrom::Start(resume_at))
                 .map_err(|e| format!("seek local: {}", e))?;
             f
         } else {
-            // اگه از آپلود قبلی یه temp مونده، بنداز دور و از صفر بساز
-            let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
-            clear_upload_marker(local_path);
             sftp.create(std::path::Path::new(&remote_tmp))
                 .map_err(|e| format!("create remote temp '{}': {}", remote_tmp, e))?
         };
@@ -667,7 +673,7 @@ impl SftpEntry {
         let write_result = (|| {
             loop {
                 if cancel.load(Ordering::Relaxed) {
-                    // فایل resumed رو unlink نکن — گیگابایت منتقل‌شده رو نگه دار
+                    // temp resumed رو unlink نکن — گیگابایت منتقل‌شده رو نگه دار
                     return Err("Cancelled".to_string());
                 }
                 let n = local_file
@@ -695,42 +701,28 @@ impl SftpEntry {
         })();
 
         if let Err(err) = write_result {
-            // آپلود ناقصِ temp رو پاک کن تا مقصد اصلی سالم بمونه؛
-            // marker رو هم بردار وگرنه دفعه بعد ممکنه روی فایل اصلی resume بشه
-            if using_temp {
+            // تلاش تازه‌ی شکست‌خورده: temp ناقص رو بردار تا marker مقصد قدیمی رو
+            // به‌اشتباه «partial» حساب نکنه. resume واقعی temp رو نگه می‌داریم.
+            if started_fresh {
                 let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
                 clear_upload_marker(local_path);
             }
             return Err(err);
         }
 
-        if using_temp {
-            // حالا که فایل کامل تو temp هست، مقصد قدیمی رو بردار و atomic-ish جایگزین کن
-            if remote_len.is_some() {
-                let _ = sftp.unlink(std::path::Path::new(remote_path));
-            }
-            sftp.rename(
-                std::path::Path::new(&remote_tmp),
-                std::path::Path::new(remote_path),
-                None,
-            )
-            .map_err(|e| {
-                // اگه rename ترکید، حداقل temp رو نگه می‌داریم تا بشه دستی نجات داد
-                format!(
-                    "promote upload temp '{}' -> '{}': {}",
-                    remote_tmp, remote_path, e
-                )
-            })?;
-        }
-
-        // فایل local وسط آپلود truncate شده باشه، EOF زودرس می‌آد — موفقیت دروغین نده.
+        // قبل از promote چک کن — فایل کوتاه نباید جای مقصد خوب بنشینه
         if total_bytes > 0 && bytes_transferred != total_bytes {
+            if started_fresh {
+                let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
+                clear_upload_marker(local_path);
+            }
             return Err(format!(
                 "incomplete upload: wrote {} of {} bytes",
                 bytes_transferred, total_bytes
             ));
         }
 
+        promote_upload_temp(&sftp, remote_path, &remote_tmp, dest_exists)?;
         clear_upload_marker(local_path);
         Ok(())
     }
@@ -1013,17 +1005,18 @@ impl SftpEntry {
                     if identical && !conflicts.forces_overwrite() {
                         return Ok(());
                     }
-                    // partial مال همین transfer (marker) → بدون unlink برو تو resume
+                    // ادامه‌ی transfer خودمون فقط وقتی temp sidecar ناقص/کامل باشه —
+                    // سایز مقصد قدیمی (مثلاً فایل کوچک‌تر overwrite) رو partial حساب نکن.
+                    let remote_tmp = format!("{}.termifai-uploading", remote_path);
+                    let tmp_len = stat_remote_brief(&sftp, &remote_tmp).and_then(|(_, sz, _)| sz);
                     let our_partial = !local_is_dir
-                        && dest_size
-                            .map(|d| d > 0 && d < local_size.unwrap_or(0))
-                            .unwrap_or(false)
                         && upload_marker_matches(
                             local_path,
                             remote_path,
                             local_size.unwrap_or(0),
                             local_mtime,
-                        );
+                        )
+                        && upload_temp_is_our_partial(tmp_len, local_size.unwrap_or(0));
                     if !our_partial {
                         let proceed = conflicts.resolve(&ConflictInfo {
                             session_id: session_id.to_string(),
@@ -1105,8 +1098,14 @@ impl SftpEntry {
                     continue;
                 }
                 let lp_str = lp.to_string_lossy();
-                let is_our_partial = dest_size.map(|d| d > 0 && d < *size).unwrap_or(false)
-                    && upload_marker_matches(&lp_str, rp, *size, local_mtime.unwrap_or(0));
+                let remote_tmp = format!("{}.termifai-uploading", rp);
+                let tmp_len = stat_remote_brief(&sftp, &remote_tmp).and_then(|(_, sz, _)| sz);
+                let is_our_partial = upload_marker_matches(
+                    &lp_str,
+                    rp,
+                    *size,
+                    local_mtime.unwrap_or(0),
+                ) && upload_temp_is_our_partial(tmp_len, *size);
                 if !is_our_partial {
                     if let Some((dest_is_dir, dest_size, dest_mtime)) = remote_brief {
                         // هم‌اندازه با محتوای متفاوت، یا فایل غریبه — از کاربر بپرس / OverwriteAll
@@ -1401,6 +1400,30 @@ fn sanitize_open_basename(name: &str) -> String {
     } else {
         trimmed
     }
+}
+
+/// temp کامل رو جای مقصد می‌ذاره. فعلاً unlink+rename (همون رفتار develop)؛
+/// PRهای باز ممکنه این رو به backup-swap امن‌تر ارتقا بدن.
+fn promote_upload_temp(
+    sftp: &ssh2::Sftp,
+    remote_path: &str,
+    remote_tmp: &str,
+    dest_exists: bool,
+) -> Result<(), String> {
+    if dest_exists {
+        let _ = sftp.unlink(std::path::Path::new(remote_path));
+    }
+    sftp.rename(
+        std::path::Path::new(remote_tmp),
+        std::path::Path::new(remote_path),
+        None,
+    )
+    .map_err(|e| {
+        format!(
+            "promote upload temp '{}' -> '{}': {}",
+            remote_tmp, remote_path, e
+        )
+    })
 }
 
 /// Creates `path` on the remote if it doesn't exist; errors if it exists as a non-directory.
@@ -1791,6 +1814,22 @@ mod tests {
         let tmp = format!("{}.termifai-uploading", remote);
         assert_eq!(tmp, "/var/data/config.json.termifai-uploading");
         assert_ne!(tmp, remote);
+    }
+
+    #[test]
+    fn overwrite_resume_must_use_temp_not_destination_size() {
+        // مقصد قدیمی ۱۰۰ بایت + marker از آپلود ۱۰۰۰ بایتی ≠ resume روی مقصد.
+        // فقط temp sidecar اجازه‌ی ResumeTemp / PromoteComplete می‌ده.
+        assert_eq!(
+            plan_upload_temp(true, Some(250), 1000),
+            UploadTempPlan::ResumeTemp { offset: 250 }
+        );
+        assert_eq!(
+            plan_upload_temp(true, None, 1000),
+            UploadTempPlan::FreshTemp
+        );
+        assert!(upload_temp_is_our_partial(Some(250), 1000));
+        assert!(!upload_temp_is_our_partial(None, 1000));
     }
 
     #[test]
