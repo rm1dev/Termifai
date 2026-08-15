@@ -445,7 +445,7 @@ fn verify_host_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ssh2::KnownHostKeyFormat;
+    use ssh2::{HostKeyType, KnownHostKeyFormat};
 
     #[test]
     fn host_key_entry_name_bare_for_default_port() {
