@@ -6,6 +6,7 @@ export interface CreateSessionRequest {
   initialCommand: string | null;
   hostId: string | null;
   readyMarker: string | null;
+  owner: "main" | "quick-terminal";
   cols?: number;
   rows?: number;
 }

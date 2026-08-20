@@ -119,6 +119,7 @@ fn create_session(
     initial_command: Option<String>,
     host_id: Option<String>,
     ready_marker: Option<String>,
+    owner: pty_manager::SessionOwner,
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> Result<TabInfo, String> {
@@ -143,6 +144,7 @@ fn create_session(
         password.as_deref(),
         ready_marker.as_deref(),
         host_id.as_deref(),
+        owner,
         cols.unwrap_or(80),
         rows.unwrap_or(24),
     )
@@ -2378,6 +2380,9 @@ fn force_quit_app(app: tauri::AppHandle) {
     // a --background instance (which would in turn respawn the daemon).
     global_hotkey::clean_quit(&app);
     global_hotkey::kill_daemon();
+    if let Ok(pty) = app.state::<AppState>().pty_manager.lock() {
+        pty.kill_all();
+    }
     app.exit(0);
 }
 
@@ -2401,7 +2406,7 @@ fn quit_to_background(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
 
     if let Ok(pty) = state.pty_manager.lock() {
-        pty.kill_all();
+        pty.kill_by_owner(pty_manager::SessionOwner::Main);
     }
     if let Ok(mut tunnels) = state.tunnel_manager.lock() {
         tunnels.stop_all();
@@ -2432,7 +2437,9 @@ fn quit_to_background(app: &tauri::AppHandle) {
     vault::on_app_exit(app);
 
     for window in app.webview_windows().values() {
-        let _ = window.hide();
+        if window.label() != quick_terminal::WINDOW_LABEL {
+            let _ = window.hide();
+        }
     }
     global_hotkey::set_dock_visible(app, false);
 
@@ -2442,7 +2449,9 @@ fn quit_to_background(app: &tauri::AppHandle) {
     // Native reload instead of eval("location.reload()"): eval is silently
     // dropped by a dead WebKit content process, reload() revives it.
     for window in app.webview_windows().values() {
-        let _ = window.reload();
+        if window.label() != quick_terminal::WINDOW_LABEL {
+            let _ = window.reload();
+        }
     }
 }
 
@@ -2761,10 +2770,14 @@ pub fn run() {
                     api.prevent_close();
                     return;
                 }
-                if label == "main"
-                    || label.starts_with("window-")
-                    || label == quick_terminal::WINDOW_LABEL
-                {
+                if label == quick_terminal::WINDOW_LABEL {
+                    // Quick Terminal is a transient panel, not an app-close request.
+                    // Never let closing it terminate the main process or its windows.
+                    quick_terminal::hide_quick_terminal(window.app_handle().clone());
+                    api.prevent_close();
+                    return;
+                }
+                if label == "main" || label.starts_with("window-") {
                     let app = window.app_handle();
                     let settings = load_general_settings(app);
                     if settings.run_in_background {
@@ -3239,6 +3252,17 @@ pub fn run() {
                 has_visible_windows: false,
                 ..
             } => {
+                // During a cold Quick Terminal launch the panel cannot mark
+                // itself shown until its hidden webview reports ready. macOS
+                // may deliver Reopen in that gap; never use it to surface
+                // the main window while the quick-terminal request is pending.
+                let quick_terminal_pending = app_handle
+                    .state::<quick_terminal::PendingToggle>()
+                    .0
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if quick_terminal::is_shown() || quick_terminal_pending {
+                    return;
+                }
                 if let Some(window) = app_handle.get_webview_window("main") {
                     revive_webview_if_stuck(&window);
                     global_hotkey::set_dock_visible(app_handle, true);

@@ -524,7 +524,30 @@ fn show_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTer
     #[cfg(target_os = "macos")]
     set_native_alpha(app, &window, 1.0);
     let _ = window.show();
-    let _ = window.set_focus();
+    // Tauri's set_focus() calls `activateIgnoringOtherApps: YES` which
+    // brings ALL app windows to front — including the main window that
+    // may be behind other apps. Use a targeted focus that only raises
+    // the Quick Terminal window without promoting every other window.
+    #[cfg(target_os = "macos")]
+    {
+        let w = window.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Ok(ns_window) = w.ns_window() {
+                unsafe {
+                    let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+                    // orderFrontRegardless brings this single window to front
+                    // even when the app is not active, without touching other
+                    // windows. makeKeyWindow gives it keyboard focus.
+                    let _: () = objc2::msg_send![ns_window, orderFrontRegardless];
+                    let _: () = objc2::msg_send![ns_window, makeKeyWindow];
+                }
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window.set_focus();
+    }
     let _ = app.emit(
         "quick-terminal:show",
         ShowPayload {
@@ -615,6 +638,12 @@ fn set_native_alpha(app: &AppHandle, window: &tauri::WebviewWindow, alpha: f64) 
             }
         }
     });
+}
+
+/// Whether Quick Terminal is logically open. Used by app-level activation
+/// handlers so they do not surface the main window during panel activation.
+pub fn is_shown() -> bool {
+    PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Toggle entry point, called by the global hotkey and by commands.

@@ -164,7 +164,13 @@ export function QuickTerminalWindow() {
         }}
       >
         <div className="min-h-0 flex-1">
-          {hasOpened && <AppShell variant="quick-terminal" onRequestClose={close} />}
+          {hasOpened && (
+            <AppShell
+              variant="quick-terminal"
+              onRequestClose={close}
+              quickTerminalEdge={edge}
+            />
+          )}
         </div>
 
         <div

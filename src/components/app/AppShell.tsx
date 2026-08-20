@@ -15,6 +15,10 @@ import {
   Plus,
   TerminalSquare,
   Folder,
+  PanelTopClose,
+  PanelBottomClose,
+  PanelLeftClose,
+  PanelRightClose,
   X,
   LayoutDashboard,
   LayoutGrid,
@@ -36,6 +40,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import type { AppTab, Host, SidebarKey, TabKind } from "./types";
 import { XTerminal } from "./XTerminal";
+import type { QuickTerminalEdge } from "@/lib/api/quick-terminal";
 import {
   isShortcutMatch,
   loadShortcuts,
@@ -83,14 +88,19 @@ export interface AppShellProps {
   /**
    * "main" (default): standard window with window controls and drag region.
    * "quick-terminal": Quake-style drop-down panel with glassmorphism,
-   * no window dragging, no window controls, and a close (×) button in the tab
+   * no window dragging, no window controls, and a hide button in the tab
    * bar that collapses the panel via `onRequestClose`.
    */
   variant?: "main" | "quick-terminal";
   onRequestClose?: () => void;
+  quickTerminalEdge?: QuickTerminalEdge;
 }
 
-export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {}) {
+export function AppShell({
+  variant = "main",
+  onRequestClose,
+  quickTerminalEdge,
+}: AppShellProps = {}) {
   const [tabs, setTabs] = useState<AppTab[]>([
     { id: "t-vaults", kind: "vaults", title: "Hosts", closable: false },
     { id: "t-term", kind: "terminal", title: "Local Terminal", closable: true },
@@ -508,6 +518,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
         platform={platform}
         variant={variant}
         onRequestClose={onRequestClose}
+        quickTerminalEdge={quickTerminalEdge}
         transparentBg={variant === "quick-terminal" || (variant === "main" && mainWindowOpacity < 1.0)}
       />
 
@@ -531,6 +542,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
                 isActive={t.id === activeTab}
                 onClose={() => closeTab(t.id)}
                 onSessionCreated={(sid) => updateTabSession(t.id, sid)}
+                owner={variant}
                 transparentBackground={variant === "quick-terminal" || (variant === "main" && mainWindowOpacity < 1.0)}
               />
             </div>
@@ -591,6 +603,7 @@ function TitleBar({
   platform,
   variant,
   onRequestClose,
+  quickTerminalEdge,
   transparentBg,
 }: {
   tabs: AppTab[];
@@ -603,9 +616,16 @@ function TitleBar({
   platform: string;
   variant: "main" | "quick-terminal";
   onRequestClose?: () => void;
+  quickTerminalEdge?: QuickTerminalEdge;
   transparentBg?: boolean;
 }) {
   const isQuickTerminal = variant === "quick-terminal";
+  const QuickTerminalHideIcon = {
+    top: PanelTopClose,
+    bottom: PanelBottomClose,
+    left: PanelLeftClose,
+    right: PanelRightClose,
+  }[quickTerminalEdge ?? "top"];
   const dragRegion = isQuickTerminal ? {} : { "data-tauri-drag-region": true };
 
   const sensors = useSensors(
@@ -806,11 +826,11 @@ function TitleBar({
       {isQuickTerminal ? (
         <button
           onClick={() => onRequestClose?.()}
-          title="Close Quick Terminal"
+          title="Hide Quick Terminal"
           className="mr-2 flex h-8 w-8 shrink-0 items-center justify-center self-center rounded-md text-muted-foreground outline-none hover:bg-[var(--color-surface-2)] hover:text-foreground focus:outline-none transition-colors"
-          aria-label="Close Quick Terminal"
+          aria-label="Hide Quick Terminal"
         >
-          <X className="h-4 w-4" />
+          <QuickTerminalHideIcon className="h-4 w-4" />
         </button>
       ) : (
         platform !== "macos" && (

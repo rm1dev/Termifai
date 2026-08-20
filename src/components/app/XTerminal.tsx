@@ -104,6 +104,7 @@ interface Props {
    * transparent one so the panel's (blurred) backdrop shows through.
    */
   transparentBackground?: boolean;
+  owner: "main" | "quick-terminal";
 }
 
 type ConnectionStage = "connecting" | "handshaking" | "authenticating" | "shell";
@@ -236,7 +237,7 @@ function EnumDropdown({
   );
 }
 
-export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated, transparentBackground }: Props) {
+export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated, transparentBackground, owner }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [isConnecting, setIsConnecting] = useState(Boolean(readyMarker && !sessionId));
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
@@ -407,6 +408,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         initialCommand: initialCommand ?? null,
         hostId: hostId ?? null,
         readyMarker: readyMarker ?? null,
+        owner,
         cols: term?.cols || undefined,
         rows: term?.rows || undefined,
       });
@@ -1365,6 +1367,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
             initialCommand: initialCommand ?? null,
             hostId: hostId ?? null,
             readyMarker: readyMarker ?? null,
+            owner,
             cols: term.cols || undefined,
             rows: term.rows || undefined,
           });
