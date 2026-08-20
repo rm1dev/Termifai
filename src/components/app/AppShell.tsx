@@ -19,6 +19,8 @@ import {
   PanelBottomClose,
   PanelLeftClose,
   PanelRightClose,
+  Pin,
+  PinOff,
   X,
   LayoutDashboard,
   LayoutGrid,
@@ -620,6 +622,8 @@ function TitleBar({
   transparentBg?: boolean;
 }) {
   const isQuickTerminal = variant === "quick-terminal";
+  const win = getCurrentWindow();
+  const [isQuickTerminalPinned, setIsQuickTerminalPinned] = useState(true);
   const QuickTerminalHideIcon = {
     top: PanelTopClose,
     bottom: PanelBottomClose,
@@ -643,6 +647,22 @@ function TitleBar({
     void win.onResized(() => { void win.isFullscreen().then(setIsFullscreen); }).then((fn) => { unlisten = fn; });
     return () => unlisten?.();
   }, [platform]);
+
+  useEffect(() => {
+    if (!isQuickTerminal) return;
+    void win.isAlwaysOnTop().then(setIsQuickTerminalPinned).catch((error) => {
+      console.error("Failed to read Quick Terminal pin state", error);
+    });
+  }, [isQuickTerminal, win]);
+
+  const toggleQuickTerminalPin = () => {
+    const next = !isQuickTerminalPinned;
+    void win.setAlwaysOnTop(next).then(() => {
+      setIsQuickTerminalPinned(next);
+    }).catch((error) => {
+      console.error("Failed to change Quick Terminal pin state", error);
+    });
+  };
 
   const handleDragEnd = (e: DragEndEvent) => {
     const { active, over } = e;
@@ -726,13 +746,27 @@ function TitleBar({
       )}
       {(isQuickTerminal || platform !== "macos") && <div className="w-3 h-full shrink-0" />}
 
+      {isQuickTerminal && (
+        <button
+          type="button"
+          onClick={toggleQuickTerminalPin}
+          title={isQuickTerminalPinned ? "Unpin Quick Terminal" : "Pin Quick Terminal"}
+          aria-label={isQuickTerminalPinned ? "Unpin Quick Terminal" : "Pin Quick Terminal"}
+          className={`mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground ${
+            isQuickTerminalPinned ? "text-[var(--color-brand-green)]" : ""
+          }`}
+        >
+          {isQuickTerminalPinned ? <Pin className="h-4 w-4" /> : <PinOff className="h-4 w-4" />}
+        </button>
+      )}
+
       <div className="flex h-full min-w-0 flex-1 items-end gap-0.5 pl-1" {...dragRegion}>
         {tabsOverflow && (
           <button
             type="button"
             onClick={() => scrollTabs(-1)}
             disabled={!canScrollLeft}
-            className="mb-1 flex h-8 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30 disabled:hover:bg-transparent"
+            className="self-center flex h-8 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30 disabled:hover:bg-transparent"
             aria-label="Scroll tabs left"
           >
             <ChevronLeft className="h-4 w-4" />
@@ -799,7 +833,7 @@ function TitleBar({
             type="button"
             onClick={() => scrollTabs(1)}
             disabled={!canScrollRight}
-            className="mb-1 flex h-8 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30 disabled:hover:bg-transparent"
+            className="self-center flex h-8 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30 disabled:hover:bg-transparent"
             aria-label="Scroll tabs right"
           >
             <ChevronRight className="h-4 w-4" />
@@ -809,7 +843,7 @@ function TitleBar({
         <button
           type="button"
           onClick={() => onNew("terminal")}
-          className={`mb-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground ${
+          className={`self-center flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground ${
             tabsOverflow ? "" : "mr-2"
           }`}
           aria-label="New Local Terminal"
@@ -882,7 +916,7 @@ function TabListMenu({
       <DropdownMenuTrigger asChild>
         <button
           type="button"
-          className="mb-1 mr-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground data-[state=open]:bg-[var(--color-surface-2)] data-[state=open]:text-foreground"
+          className="self-center mr-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground data-[state=open]:bg-[var(--color-surface-2)] data-[state=open]:text-foreground"
           aria-label="Show all tabs"
           title="All tabs"
         >

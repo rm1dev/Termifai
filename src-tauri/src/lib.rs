@@ -3000,7 +3000,30 @@ pub fn run() {
                         .build(),
                 );
             }
-            qt_builder.visible(false).build()?;
+            let quick_terminal_window = qt_builder.visible(false).build()?;
+            let quick_terminal_handle = app.handle().clone();
+            quick_terminal_window.on_window_event(move |event| {
+                if !matches!(event, tauri::WindowEvent::Focused(false)) {
+                    return;
+                }
+
+                // Showing the panel focuses it asynchronously on macOS. Recheck after
+                // that handoff so a transient focus event cannot hide a newly opened panel.
+                let app = quick_terminal_handle.clone();
+                let window = app.get_webview_window(quick_terminal::WINDOW_LABEL);
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                    if quick_terminal::is_shown()
+                        && window.as_ref().is_some_and(|window| {
+                            window.is_visible().unwrap_or(false)
+                                && !window.is_focused().unwrap_or(false)
+                                && !window.is_always_on_top().unwrap_or(true)
+                        })
+                    {
+                        quick_terminal::hide_quick_terminal(app);
+                    }
+                });
+            });
 
             let app_handle = app.handle().clone();
             if let Some(main_win) = app.get_webview_window("main") {
