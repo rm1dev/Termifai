@@ -1,5 +1,5 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,10 +23,18 @@ struct ConnectionStatusPayload {
     log: Option<String>,
 }
 
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionOwner {
+    Main,
+    QuickTerminal,
+}
+
 struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     host_id: Option<String>,
+    owner: SessionOwner,
 }
 
 pub struct PtyManager {
@@ -50,6 +58,7 @@ impl PtyManager {
         initial_password: Option<&str>,
         ready_marker: Option<&str>,
         host_id: Option<&str>,
+        owner: SessionOwner,
         cols: u16,
         rows: u16,
     ) -> Result<TabInfo, String> {
@@ -114,6 +123,7 @@ impl PtyManager {
             master: pair.master,
             writer,
             host_id: host_id.map(|s| s.to_string()),
+            owner,
         };
 
         self.sessions
@@ -326,8 +336,15 @@ impl PtyManager {
         Ok(())
     }
 
-    /// Drops every session (same teardown as close_session) — used by
-    /// quit-to-background so the next open starts with no terminals.
+    /// Drops sessions owned by the specified window while preserving independent sessions.
+    pub fn kill_by_owner(&self, owner: SessionOwner) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .retain(|_, session| session.owner != owner);
+    }
+
+    /// Drops every session for a full application shutdown.
     pub fn kill_all(&self) {
         self.sessions.lock().unwrap().clear();
     }
@@ -848,6 +865,7 @@ mod tests {
                 master: pair.master,
                 writer,
                 host_id: None,
+                owner: SessionOwner::Main,
             },
         );
         assert_eq!(mgr.sessions.lock().unwrap().len(), 1);
