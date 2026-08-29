@@ -296,4 +296,72 @@ mod tests {
         assert!(ids.contains(&"g2"), "remote-only entity from prior merge must survive");
         assert!(ids.contains(&"g3"), "local save during sync must not be clobbered");
     }
+
+    #[test]
+    fn settings_live_cache_edit_wins_over_stale_outcome() {
+        // End-of-sync must merge the live settings cache into the outcome;
+        // otherwise a theme/shortcut change during run_sync is overwritten and
+        // the follow-up auto-sync re-uploads the stale gather-time value.
+        let gather_time = SettingsBlob {
+            value: Some(serde_json::json!("dark")),
+            updated_at: Some("2026-01-01T00:00:00Z".into()),
+        };
+        let live_edit = SettingsBlob {
+            value: Some(serde_json::json!("light")),
+            updated_at: Some("2026-06-01T00:00:00Z".into()),
+        };
+        let outcome = SettingsPayload {
+            app_theme: gather_time,
+            ..Default::default()
+        };
+        let live = SettingsPayload {
+            app_theme: live_edit,
+            ..Default::default()
+        };
+        let merged = merge_settings(&live, &outcome);
+        assert_eq!(
+            merged.app_theme.value,
+            Some(serde_json::json!("light")),
+            "live cache edit during sync must not be clobbered by gather-time outcome"
+        );
+    }
+
+    fn script_snippet(id: &str, updated_at: &str, body: Option<&str>) -> Snippet {
+        Snippet {
+            id: id.to_string(),
+            kind: crate::model::snippets::SnippetKind::Script,
+            name: id.to_string(),
+            body: None,
+            command: None,
+            script: body.map(|s| s.to_string()),
+            variables: vec![],
+            group_id: None,
+            keyword: None,
+            os_targets: vec![],
+            created_at: Some(updated_at.to_string()),
+            updated_at: Some(updated_at.to_string()),
+            run_as_sudo: None,
+        }
+    }
+
+    #[test]
+    fn script_equal_updated_at_prefers_local_none_over_remote_body() {
+        // Documents the gather hazard fixed in sync.rs: if local `.sh` is
+        // missing (list_snippets leaves script=None) while updated_at ties,
+        // LWW+equal device_id uploads None and wipes the remote script body.
+        let local = vec![script_snippet("s1", "2026-01-01T00:00:00Z", None)];
+        let remote = vec![script_snippet("s1", "2026-01-01T00:00:00Z", Some("echo hi"))];
+        let merged = merge_entities(
+            local,
+            remote,
+            &[],
+            EntityKind::Snippet,
+            "dev-z",
+            "dev-a",
+        );
+        assert!(
+            merged[0].script.is_none(),
+            "equal device-id tie-break prefers local — missing .sh would wipe remote body"
+        );
+    }
 }

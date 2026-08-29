@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback, forwardRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
-import { posixShellQuote } from "@/lib/shell-quote";
+import { posixShellQuote, sshCliDestination } from "@/lib/shell-quote";
 import { subscribe } from "@/lib/api/transport";
 import { forceQuitApp, openSettingsWindow, quitApp, takePendingOpenFolders } from "@/lib/api/terminal";
 import { listSshKeys } from "@/lib/api/ssh-keys";
@@ -230,7 +230,12 @@ export function AppShell({
     // ServerAlive*: let ssh itself detect a dead connection (3 missed keepalives,
     // ~15s) instead of us guessing from unanswered keystrokes — that would
     // misfire on ordinary latency spikes or brief network blips.
-    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3${keyArg}${portArg} ${posixShellQuote(`${host.user}@${host.hostname}`)} ${posixShellQuote(remoteBootstrap)}`;
+    // `--` before user@host: same injection class as the backend
+    // test_host_connection / port-forward paths (1565784). Shell quoting
+    // alone does not stop OpenSSH from treating a leading-dash username as
+    // an option (e.g. -oProxyCommand=… → local RCE) when a malicious host
+    // arrives via sync or a pre-validation vault entry.
+    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3${keyArg}${portArg} ${sshCliDestination(host.user, host.hostname)} ${posixShellQuote(remoteBootstrap)}`;
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
