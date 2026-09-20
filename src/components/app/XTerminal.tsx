@@ -29,7 +29,9 @@ import { matchesOsTarget } from "@/features/snippets/osTargets";
 import {
   ensureTerminalFontLoaded,
   getTerminalFontStack,
+  isTerminalFontReady,
   loadTerminalAppearance,
+  remeasureTerminalFont,
   terminalAppearanceChangedEvent,
   terminalAppearanceStorageKey,
   type TerminalAppearance,
@@ -1118,6 +1120,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         term.options.fontFamily = getTerminalFontStack(nextAppearance.fontFamily);
         term.options.fontSize = nextAppearance.fontSize;
         term.options.lineHeight = nextAppearance.lineHeight;
+        // If the family string didn't actually change (same font, different
+        // size/lineHeight — or a font that only *now* finished loading),
+        // xterm keeps its cached char metrics and stale letter-spacing.
+        remeasureTerminalFont(term);
         safeFit();
         rtlOverlay.refresh();
       });
@@ -1165,12 +1171,41 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       }
     };
     window.addEventListener("storage", onShortcutStorageChanged);
+    // The terminal is constructed with the desired font, but on a cold start
+    // the webfont usually isn't available yet, so xterm's first character
+    // measurement happens against `ui-monospace`. Those metrics are cached and
+    // never recomputed on their own (OptionsService ignores setting an option
+    // to the value it already has), leaving the DOM renderer with a
+    // letter-spacing computed for the *wrong* font — the per-instance "text
+    // indent" drift. Closing and reopening the tab hid it only because by then
+    // the font was already in the document's font cache.
     void ensureTerminalFontLoaded(appearance).then(() => {
+      if (destroyed) return;
       term.options.fontFamily = getTerminalFontStack(appearance.fontFamily);
       term.options.fontSize = appearance.fontSize;
       term.options.lineHeight = appearance.lineHeight;
+      remeasureTerminalFont(term);
       safeFit();
+      rtlOverlay.refresh();
     });
+    // Belt and braces: `document.fonts.ready` can resolve before a face that
+    // was requested by *another* terminal instance in the same frame has
+    // swapped in. Watch the font set until this terminal's font really is
+    // usable, then force one more measurement pass.
+    if (!isTerminalFontReady(appearance)) {
+      let fontAttempts = 0;
+      const verifyFont = () => {
+        if (destroyed) return;
+        if (isTerminalFontReady(appearance)) {
+          remeasureTerminalFont(term);
+          safeFit();
+          rtlOverlay.refresh();
+          return;
+        }
+        if (++fontAttempts < 40) setTimeout(verifyFont, 50);
+      };
+      setTimeout(verifyFont, 50);
+    }
     void subscribe<TerminalAppearance>(terminalAppearanceChangedEvent, (event) => {
       applyAppearance(event.payload);
     })
