@@ -46,9 +46,62 @@ export async function ensureTerminalFontLoaded(appearance: TerminalAppearance) {
   const fontSize = clampTerminalFontSize(appearance.fontSize);
 
   try {
-    await document.fonts.load(`${fontSize}px ${fontFamily}`);
+    // Bold is measured separately by xterm's WidthCache — if only the regular
+    // face is loaded, bold cells fall back to a different font and get their
+    // own (wrong) advance width.
+    await Promise.all([
+      document.fonts.load(`${fontSize}px ${fontFamily}`),
+      document.fonts.load(`bold ${fontSize}px ${fontFamily}`),
+    ]);
+    // `fonts.load()` resolves per face; `fonts.ready` waits for the document's
+    // whole font-loading pass to settle so a later swap can't land *after* we
+    // measured.
+    await document.fonts.ready;
   } catch {
     /* Font loading is best-effort; xterm will still attempt to render. */
+  }
+}
+
+/** Is the terminal font actually usable right now (not a fallback)? */
+export function isTerminalFontReady(appearance: TerminalAppearance): boolean {
+  try {
+    const fontSize = clampTerminalFontSize(appearance.fontSize);
+    return (
+      document.fonts.check(`${fontSize}px "${appearance.fontFamily}"`) &&
+      document.fonts.check(`bold ${fontSize}px "${appearance.fontFamily}"`)
+    );
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * xterm caches character metrics (CharSizeService + the DOM renderer's
+ * WidthCache) and only re-measures when an option *value actually changes* —
+ * `rawOptions[k] !== v` is the guard inside OptionsService. So re-assigning the
+ * same fontFamily/fontSize after a webfont finishes loading is a no-op, and the
+ * terminal keeps the cell width it measured against the fallback font. The DOM
+ * renderer then keeps `letter-spacing: cellWidth - measure("W")` from that stale
+ * measurement, which is exactly the "text indent looks different in this
+ * instance" symptom.
+ *
+ * Flipping the family to something else and straight back forces both
+ * invalidations (CharSizeService.measure + widthCache.clear) with the real font
+ * in place.
+ */
+export function remeasureTerminalFont(term: {
+  options: { fontFamily?: string; fontSize?: number };
+  refresh: (start: number, end: number) => void;
+  rows: number;
+}) {
+  const current = term.options.fontFamily;
+  if (!current) return;
+  try {
+    term.options.fontFamily = current === fallbackFontFamily ? "monospace" : fallbackFontFamily;
+    term.options.fontFamily = current;
+    term.refresh(0, Math.max(0, term.rows - 1));
+  } catch {
+    /* terminal disposed mid-flight */
   }
 }
 
