@@ -14,7 +14,10 @@ use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use ssh2::{CheckResult, HashType, KnownHostFileKind, MethodType, Session};
+use ssh2::{
+    CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHosts, MethodType, Session,
+};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -305,6 +308,102 @@ fn host_key_entry_name(hostname: &str, port: u16) -> String {
     }
 }
 
+/// Loads `~/.ssh/known_hosts` into an in-memory libssh2 set.
+///
+/// Missing file = empty set (first run). If the file *exists* but libssh2
+/// cannot fully parse it, we fail closed: a partial load + later
+/// `write_file` would truncate every entry after the bad line (classic
+/// libssh2 footgun). Callers must not ignore this error and rewrite.
+fn load_known_hosts(known_hosts: &mut KnownHosts, path: &Path) -> Result<(), SshError> {
+    match known_hosts.read_file(path, KnownHostFileKind::OpenSSH) {
+        Ok(_) => Ok(()),
+        Err(_) if !path.exists() => Ok(()),
+        Err(e) => Err(SshError::HostKeyCheckFailed(format!(
+            "could not fully parse {} — refusing TOFU rewrite of a partial load ({e}). \
+             Fix or remove the unreadable line and retry.",
+            path.display()
+        ))),
+    }
+}
+
+/// Ensures `path` ends with a newline before an append (no-op if empty/missing).
+fn ensure_trailing_newline(path: &Path) -> Result<(), SshError> {
+    let mut f = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(SshError::HostKeyCheckFailed(format!(
+                "open known_hosts for newline check: {e}"
+            )))
+        }
+    };
+    let len = f
+        .seek(SeekFrom::End(0))
+        .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
+    if len == 0 {
+        return Ok(());
+    }
+    f.seek(SeekFrom::End(-1))
+        .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)
+        .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    drop(f);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(b"\n"))
+        .map_err(|e| SshError::HostKeyCheckFailed(format!("append newline: {e}")))
+}
+
+/// Trust-on-first-use: append a single OpenSSH-format line.
+///
+/// Never call `KnownHosts::write_file` on the user's real known_hosts — that
+/// rewrites the whole file from libssh2's in-memory set and permanently drops
+/// any entries that failed to load (and comments / markers the rewrite omits).
+fn append_tofu_host_key(
+    path: &Path,
+    hostname: &str,
+    port: u16,
+    key: &[u8],
+    key_type: HostKeyType,
+) -> Result<(), SshError> {
+    let entry_host = host_key_entry_name(hostname, port);
+
+    // یه KnownHosts خالی فقط برای فرمت کردن همون یک خط جدید
+    let scratch =
+        Session::new().map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
+    let mut kh = scratch
+        .known_hosts()
+        .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
+    kh.add(&entry_host, key, hostname, key_type.into())
+        .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
+
+    let tmp_path = path.with_extension("termifai-tofu.tmp");
+    kh.write_file(&tmp_path, KnownHostFileKind::OpenSSH)
+        .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
+    let line = std::fs::read_to_string(&tmp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        SshError::HostKeyCheckFailed(format!("read TOFU temp line: {e}"))
+    })?;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    ensure_trailing_newline(path)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .map_err(|e| SshError::HostKeyCheckFailed(format!("append known_hosts: {e}")))?;
+    Ok(())
+}
+
 fn verify_host_key(
     session: &Session,
     hostname: &str,
@@ -323,8 +422,7 @@ fn verify_host_key(
     let mut known_hosts = session
         .known_hosts()
         .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
-    // Missing file is fine on first run — nothing is "known" yet.
-    let _ = known_hosts.read_file(&known_hosts_path, KnownHostFileKind::OpenSSH);
+    load_known_hosts(&mut known_hosts, &known_hosts_path)?;
 
     match known_hosts.check_port(hostname, port, key) {
         CheckResult::Match => Ok(()),
@@ -333,16 +431,8 @@ fn verify_host_key(
                 "handshaking",
                 &format!("Host key not yet known — trusting on first use ({fingerprint})."),
             );
-            let entry_host = host_key_entry_name(hostname, port);
-            known_hosts
-                .add(&entry_host, key, hostname, key_type.into())
-                .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
-            if let Some(parent) = known_hosts_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            known_hosts
-                .write_file(&known_hosts_path, KnownHostFileKind::OpenSSH)
-                .map_err(|e| SshError::HostKeyCheckFailed(e.to_string()))?;
+            // فقط append — write_file روی فایل واقعی = خطر truncate
+            append_tofu_host_key(&known_hosts_path, hostname, port, key, key_type)?;
             Ok(())
         }
         CheckResult::Mismatch => Err(SshError::HostKeyMismatch { fingerprint }),
@@ -355,7 +445,7 @@ fn verify_host_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ssh2::KnownHostKeyFormat;
+    use ssh2::{HostKeyType, KnownHostKeyFormat};
 
     #[test]
     fn host_key_entry_name_bare_for_default_port() {
@@ -491,5 +581,93 @@ mod tests {
             known_hosts.check("example.com", other_key),
             CheckResult::Mismatch
         ));
+    }
+
+    /// Regression: a truncated mid-file line makes libssh2 return Err after a
+    /// *partial* load. Ignoring that error and calling `write_file` permanently
+    /// drops every host after the bad line — the bug `load_known_hosts` +
+    /// `append_tofu_host_key` exist to prevent.
+    #[test]
+    fn load_known_hosts_fails_closed_on_partial_parse() {
+        let dir = std::env::temp_dir().join(format!(
+            "termifai-kh-partial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let ed = "AAAAC3NzaC1lZDI1NTE5AAAAIKilYz8A3vG2kY1pQ9sW7xE4rT6uI0oP2aS5dF8gH1j";
+        std::fs::write(
+            &path,
+            format!(
+                "alpha.example.com ssh-ed25519 {ed}\n\
+                 broken.example.com ssh-rsa\n\
+                 omega.example.com ssh-ed25519 {ed}\n"
+            ),
+        )
+        .unwrap();
+
+        let session = Session::new().unwrap();
+        let mut known_hosts = session.known_hosts().unwrap();
+        let err = load_known_hosts(&mut known_hosts, &path).expect_err("must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing TOFU rewrite") || msg.contains("partial load"),
+            "unexpected message: {msg}"
+        );
+
+        // فایل دست‌نخورده بمونه
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("omega.example.com"));
+        assert!(on_disk.contains("broken.example.com"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_known_hosts_accepts_missing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "termifai-kh-missing-{}-known_hosts",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let session = Session::new().unwrap();
+        let mut known_hosts = session.known_hosts().unwrap();
+        load_known_hosts(&mut known_hosts, &path).expect("missing file is first-run OK");
+    }
+
+    #[test]
+    fn append_tofu_preserves_existing_entries_and_bad_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "termifai-kh-append-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let ed = "AAAAC3NzaC1lZDI1NTE5AAAAIKilYz8A3vG2kY1pQ9sW7xE4rT6uI0oP2aS5dF8gH1j";
+        // فایل سالم (parse کامل) — append نباید چیزی رو پاک کنه
+        std::fs::write(
+            &path,
+            format!(
+                "# keep me\nalpha.example.com ssh-ed25519 {ed}\nomega.example.com ssh-ed25519 {ed}"
+            ),
+        )
+        .unwrap();
+
+        append_tofu_host_key(
+            &path,
+            "new.example.com",
+            22,
+            b"fake-new-host-key-bytes-xxxxxxxxxxxx",
+            HostKeyType::Ed25519,
+        )
+        .unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("# keep me"), "comment must survive append");
+        assert!(on_disk.contains("alpha.example.com"));
+        assert!(on_disk.contains("omega.example.com"));
+        assert!(on_disk.contains("new.example.com"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
