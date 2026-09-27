@@ -140,9 +140,9 @@ mod previous_app {
     ///  * this app is still active (the panel had focus) — activation must
     ///    be handed back to the previous app, possibly with retries while
     ///    this app's own pending activation settles;
-    ///  * this app is NOT active yet, but the activation requested by
-    ///    `set_focus` at show time can land seconds later — with the panel
-    ///    gone, AppKit would key the main window, visibly stealing focus.
+    ///  * this app is NOT active yet, but the activation requested at show
+    ///    time can land seconds later — with the panel gone, AppKit would key
+    ///    the main window, visibly stealing focus.
     ///
     /// So for a grace period the panel window stays ordered-in (parked
     /// off-screen / fully transparent, i.e. invisible): any late activation
@@ -506,12 +506,227 @@ fn slide(window: tauri::WebviewWindow, from: (f64, f64), to: (f64, f64), hide_af
     generation
 }
 
+// ── macOS: focus the panel without raising the app's other windows ──────────
+//
+// Two broken extremes and why:
+//  * `set_focus()` (Tauri → `activateIgnoringOtherApps:`) activates the app,
+//    and since Big Sur app activation brings ALL of the app's windows to the
+//    front — so summoning the panel over another app dragged a backgrounded
+//    main window on top of it.
+//  * `orderFrontRegardless` + `makeKeyWindow` WITHOUT activating the app
+//    leaves the panel with no keyboard focus at all: macOS routes key events
+//    to the *active* app, so a merely key window of an inactive app cannot
+//    receive input.
+//
+// The fix activates the app but asks the WindowServer to raise ONLY the
+// panel: `_SLPSSetFrontProcessWithOptions(psn, wid, user_generated)` — the
+// same mechanism window switchers (AltTab, yabai) use to focus a single
+// window of an app. The user-generated flag is accurate (the switch
+// originates from the user's hotkey press) and keeps macOS 14+ cooperative
+// activation from suppressing the request. If that mechanism is unavailable
+// or gets refused, `wait_for_activation_then_key` falls back to plain
+// activation — the pre-fix behaviour, which guarantees focus at the cost of
+// possibly raising sibling windows.
+//
+// Ordering matters: the panel is made key only AFTER activation lands (see
+// wait_for_activation_then_key). Keying it earlier, while the app is still
+// inactive, records key state without delivering becomeKeyWindow — so
+// keystrokes reach the webview yet it never learns it is focused: no cursor
+// blink, no focus/blur events, no Focused(false) on click-away.
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcessSerialNumber {
+    hi: u32,
+    lo: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn GetProcessForPID(pid: std::ffi::c_int, psn: *mut ProcessSerialNumber) -> std::ffi::c_int;
+}
+
+/// Switches the front process to this app asking the WindowServer to raise
+/// only `window_id`. Returns false when the mechanism is unavailable.
+#[cfg(target_os = "macos")]
+fn front_switch_raising_only(window_id: u32) -> bool {
+    type SlpsSetFrontProcess =
+        unsafe extern "C" fn(*mut ProcessSerialNumber, u32, u32) -> std::ffi::c_int;
+
+    // `_SLPSSetFrontProcessWithOptions` mode flag: mark the front-switch as
+    // user-initiated so cooperative activation (macOS 14+) honours it. No
+    // all-windows bit → only `window_id` comes forward.
+    const MODE_USER_GENERATED: u32 = 0x200;
+    const SKYLIGHT_DYLIB: &[u8] =
+        b"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight\0";
+    const SLPS_SYMBOL: &[u8] = b"_SLPSSetFrontProcessWithOptions\0";
+
+    static SLPS: std::sync::OnceLock<Option<SlpsSetFrontProcess>> = std::sync::OnceLock::new();
+    let Some(slps) = *SLPS.get_or_init(|| unsafe {
+        extern "C" {
+            fn dlopen(
+                path: *const std::ffi::c_char,
+                mode: std::ffi::c_int,
+            ) -> *mut std::ffi::c_void;
+            fn dlsym(
+                handle: *mut std::ffi::c_void,
+                name: *const std::ffi::c_char,
+            ) -> *mut std::ffi::c_void;
+        }
+        // RTLD_LAZY on Darwin.
+        let handle = dlopen(SKYLIGHT_DYLIB.as_ptr() as *const std::ffi::c_char, 2);
+        if handle.is_null() {
+            return None;
+        }
+        let sym = dlsym(handle, SLPS_SYMBOL.as_ptr() as *const std::ffi::c_char);
+        std::mem::transmute::<*mut std::ffi::c_void, Option<SlpsSetFrontProcess>>(sym)
+    }) else {
+        return false;
+    };
+
+    let mut psn = ProcessSerialNumber { hi: 0, lo: 0 };
+    unsafe {
+        if GetProcessForPID(std::process::id() as std::ffi::c_int, &mut psn) != 0 {
+            return false;
+        }
+        let _ = slps(&mut psn, window_id, MODE_USER_GENERATED);
+    }
+    true
+}
+
+/// Plain `activateIgnoringOtherApps:` — raises every app window, last resort
+/// only, when the targeted front-switch is unavailable/refused.
+#[cfg(target_os = "macos")]
+fn activate_app_blunt() {
+    unsafe {
+        let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
+            objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+        let _: () = objc2::msg_send![&*nsapp, activateIgnoringOtherApps: true];
+    }
+}
+
+/// Makes the panel the app's key window.
+#[cfg(target_os = "macos")]
+fn key_panel_window(window: &tauri::WebviewWindow) {
+    if let Ok(ns_window) = window.ns_window() {
+        unsafe {
+            let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+            let _: () = objc2::msg_send![ns_window, makeKeyWindow];
+        }
+    }
+}
+
+/// Waits for the app's activation to land, then makes the panel the key
+/// window. The keying MUST happen after activation: keying a window of an
+/// inactive app records the key state without ever delivering the
+/// becomeKeyWindow transition, leaving AppKit/WKWebView convinced the
+/// webview is unfocused even though keystrokes reach it (no cursor blink,
+/// no blur on click-away). If the targeted front-switch never lands within
+/// the grace period, falls back to plain activation and still waits for it.
+#[cfg(target_os = "macos")]
+fn wait_for_activation_then_key(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    mut blunt_issued: bool,
+) {
+    tauri::async_runtime::spawn(async move {
+        for tick in 0..48 {
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                return; // Panel dismissed in the meantime.
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if app
+                .run_on_main_thread(move || {
+                    let active: bool = unsafe {
+                        let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
+                            objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+                        objc2::msg_send![&*nsapp, isActive]
+                    };
+                    let _ = tx.send(active);
+                })
+                .is_err()
+            {
+                return;
+            }
+            if let Ok(true) = rx.await {
+                // Activation landed: now key the panel so becomeKeyWindow is
+                // delivered and AppKit/WKWebView focus state converges.
+                let _ = app.run_on_main_thread(move || {
+                    if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                        key_panel_window(&window);
+                    }
+                });
+                return;
+            }
+            if tick == 23 && !blunt_issued {
+                // The targeted front-switch never landed — fall back to the
+                // blunt activation (pre-fix behaviour: focus guaranteed, may
+                // raise sibling windows), then keep waiting to key the panel.
+                blunt_issued = true;
+                let _ = app.run_on_main_thread(move || {
+                    if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                        activate_app_blunt();
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// Keyboard-focus the panel on macOS. Must be called for a panel that was
+/// just shown; see the module-section comment above for the full rationale.
+#[cfg(target_os = "macos")]
+fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let app = app.clone();
+    let w = window.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        let app_active: bool = unsafe {
+            let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
+                objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+            objc2::msg_send![&*nsapp, isActive]
+        };
+        let window_id = if let Ok(ns_window) = w.ns_window() {
+            let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+            unsafe {
+                // Frontmost first, so a front-window-only switch raises the
+                // panel and not the app's other windows. Deliberately NOT
+                // makeKeyWindow here while the app is inactive — see
+                // wait_for_activation_then_key.
+                let _: () = objc2::msg_send![ns_window, orderFrontRegardless];
+                let wid: i64 = objc2::msg_send![ns_window, windowNumber];
+                Some(wid as u32)
+            }
+        } else {
+            None
+        };
+        if app_active {
+            // Summoned while this app was already frontmost (e.g. from the
+            // main window or tray): keying the panel is all it takes — the
+            // key transition happens while the app is active, so focus state
+            // converges normally and nothing else gets raised.
+            key_panel_window(&w);
+            return;
+        }
+        let Some(window_id) = window_id else {
+            return;
+        };
+        let mut blunt_issued = false;
+        if !front_switch_raising_only(window_id) {
+            activate_app_blunt();
+            blunt_issued = true;
+        }
+        wait_for_activation_then_key(app, w, blunt_issued);
+    });
+}
+
 fn show_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTerminalSettings) {
     let Some(monitor) = target_monitor(app) else {
         return;
     };
     PANEL_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
-    // Must be sampled before set_focus below makes this app frontmost.
+    // Must be sampled before the focus handling below makes this app frontmost.
     #[cfg(target_os = "macos")]
     previous_app::remember_frontmost(app);
     let animate = !has_monitor_beyond(app, &monitor, settings.edge);
@@ -524,26 +739,10 @@ fn show_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTer
     #[cfg(target_os = "macos")]
     set_native_alpha(app, &window, 1.0);
     let _ = window.show();
-    // Tauri's set_focus() calls `activateIgnoringOtherApps: YES` which
-    // brings ALL app windows to front — including the main window that
-    // may be behind other apps. Use a targeted focus that only raises
-    // the Quick Terminal window without promoting every other window.
+    // Give the panel keyboard focus WITHOUT dragging the app's other windows
+    // to the front (a main window parked behind other apps must stay there).
     #[cfg(target_os = "macos")]
-    {
-        let w = window.clone();
-        let _ = app.run_on_main_thread(move || {
-            if let Ok(ns_window) = w.ns_window() {
-                unsafe {
-                    let ns_window = ns_window as *mut objc2::runtime::AnyObject;
-                    // orderFrontRegardless brings this single window to front
-                    // even when the app is not active, without touching other
-                    // windows. makeKeyWindow gives it keyboard focus.
-                    let _: () = objc2::msg_send![ns_window, orderFrontRegardless];
-                    let _: () = objc2::msg_send![ns_window, makeKeyWindow];
-                }
-            }
-        });
-    }
+    focus_panel_macos(app, &window);
     #[cfg(not(target_os = "macos"))]
     {
         let _ = window.set_focus();
