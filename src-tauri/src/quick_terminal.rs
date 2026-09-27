@@ -595,6 +595,28 @@ fn front_switch_raising_only(window_id: u32) -> bool {
     true
 }
 
+/// TEMPORARY focus diagnostics: release builds have no log sink, so the
+/// focus flow appends to `quick_terminal_focus.log` in the app data dir.
+#[cfg(target_os = "macos")]
+pub fn focus_debug(app: &AppHandle, msg: &str) {
+    use std::io::Write;
+    let Some(dir) = app.path().app_data_dir().ok() else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("quick_terminal_focus.log"))
+    else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _ = writeln!(file, "[{ts}] {msg}");
+}
+
 /// Plain `activateIgnoringOtherApps:` — raises every app window, last resort
 /// only, when the targeted front-switch is unavailable/refused.
 #[cfg(target_os = "macos")]
@@ -606,14 +628,44 @@ fn activate_app_blunt() {
     }
 }
 
-/// Makes the panel the app's key window.
+/// Makes the panel the app's key window and first-responder-assigns its
+/// webview, so the focused DOM element (the terminal textarea) gets input
+/// focus. Returns (isKeyWindow, app isActive) right afterwards for tracing.
 #[cfg(target_os = "macos")]
-fn key_panel_window(window: &tauri::WebviewWindow) {
-    if let Ok(ns_window) = window.ns_window() {
-        unsafe {
-            let ns_window = ns_window as *mut objc2::runtime::AnyObject;
-            let _: () = objc2::msg_send![ns_window, makeKeyWindow];
+fn key_panel_window(window: &tauri::WebviewWindow) -> (bool, bool) {
+    let Some(ns_window) = window.ns_window().ok() else {
+        return (false, false);
+    };
+    let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+    unsafe {
+        let _: () = objc2::msg_send![ns_window, makeKeyWindow];
+        let content: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
+            objc2::msg_send![ns_window, contentView];
+        if let Some(content) = content {
+            let _: () = objc2::msg_send![ns_window, makeFirstResponder: &*content];
         }
+        let is_key: bool = objc2::msg_send![ns_window, isKeyWindow];
+        let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
+            objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+        let is_active: bool = objc2::msg_send![&*nsapp, isActive];
+        (is_key, is_active)
+    }
+}
+
+/// Reads the panel's current focus state without changing anything.
+#[cfg(target_os = "macos")]
+fn key_panel_state(window: &tauri::WebviewWindow) -> (bool, bool, bool) {
+    let tauri_focus = window.is_focused().unwrap_or(false);
+    let Some(ns_window) = window.ns_window().ok() else {
+        return (false, false, tauri_focus);
+    };
+    let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+    unsafe {
+        let is_key: bool = objc2::msg_send![ns_window, isKeyWindow];
+        let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
+            objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+        let is_active: bool = objc2::msg_send![&*nsapp, isActive];
+        (is_key, is_active, tauri_focus)
     }
 }
 
@@ -634,6 +686,7 @@ fn wait_for_activation_then_key(
         for tick in 0..48 {
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                focus_debug(&app, "watchdog aborted: panel hidden");
                 return; // Panel dismissed in the meantime.
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -653,9 +706,37 @@ fn wait_for_activation_then_key(
             if let Ok(true) = rx.await {
                 // Activation landed: now key the panel so becomeKeyWindow is
                 // delivered and AppKit/WKWebView focus state converges.
+                let logger = app.clone();
                 let _ = app.run_on_main_thread(move || {
-                    if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
-                        key_panel_window(&window);
+                    if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let (is_key, is_active) = key_panel_window(&window);
+                    focus_debug(
+                        &logger,
+                        &format!("tick {tick}: keyed is_key={is_key} active={is_active}"),
+                    );
+                });
+                // Re-check shortly after: catches anything that steals the
+                // key state back right after we set it.
+                let recheck = app.clone();
+                let recheck_window = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if recheck
+                        .run_on_main_thread(move || {
+                            let _ = tx.send(key_panel_state(&recheck_window));
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Ok((is_key, is_active, has_focus)) = rx.await {
+                        focus_debug(
+                            &app,
+                            &format!("recheck: key={is_key} active={is_active} focus={has_focus}"),
+                        );
                     }
                 });
                 return;
@@ -665,6 +746,8 @@ fn wait_for_activation_then_key(
                 // blunt activation (pre-fix behaviour: focus guaranteed, may
                 // raise sibling windows), then keep waiting to key the panel.
                 blunt_issued = true;
+                let logger = app.clone();
+                focus_debug(&logger, "front-switch never landed → fallback blunt activation");
                 let _ = app.run_on_main_thread(move || {
                     if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
                         activate_app_blunt();
@@ -672,6 +755,7 @@ fn wait_for_activation_then_key(
                 });
             }
         }
+        focus_debug(&app, "gave up: app never became active within 720ms");
     });
 }
 
@@ -699,21 +783,30 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
                 Some(wid as u32)
             }
         } else {
+            focus_debug(&app, "show: ns_window unavailable");
             None
         };
+        focus_debug(&app, &format!("show: app_active={app_active} wid={window_id:?}"));
         if app_active {
             // Summoned while this app was already frontmost (e.g. from the
             // main window or tray): keying the panel is all it takes — the
             // key transition happens while the app is active, so focus state
             // converges normally and nothing else gets raised.
-            key_panel_window(&w);
+            let (is_key, is_active) = key_panel_window(&w);
+            focus_debug(
+                &app,
+                &format!("already-active: keyed is_key={is_key} active={is_active}"),
+            );
             return;
         }
         let Some(window_id) = window_id else {
             return;
         };
         let mut blunt_issued = false;
-        if !front_switch_raising_only(window_id) {
+        if front_switch_raising_only(window_id) {
+            focus_debug(&app, &format!("slps front-switch issued for wid={window_id}"));
+        } else {
+            focus_debug(&app, "slps unavailable → immediate blunt activation");
             activate_app_blunt();
             blunt_issued = true;
         }
@@ -770,6 +863,8 @@ fn show_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTer
 /// monitor.
 fn hide_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTerminalSettings) {
     PANEL_SHOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(target_os = "macos")]
+    focus_debug(app, "hide_panel");
     #[cfg(target_os = "macos")]
     let restore_pid = previous_app::origin();
     // If another monitor adjoins the slide edge, don't animate — the panel

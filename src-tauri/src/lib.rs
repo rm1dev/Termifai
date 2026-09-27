@@ -3003,6 +3003,13 @@ pub fn run() {
             let quick_terminal_window = qt_builder.visible(false).build()?;
             let quick_terminal_handle = app.handle().clone();
             quick_terminal_window.on_window_event(move |event| {
+                #[cfg(target_os = "macos")]
+                if let tauri::WindowEvent::Focused(focused) = event {
+                    quick_terminal::focus_debug(
+                        &quick_terminal_handle,
+                        &format!("panel Focused({focused})"),
+                    );
+                }
                 if !matches!(event, tauri::WindowEvent::Focused(false)) {
                     return;
                 }
