@@ -533,6 +533,13 @@ fn slide(window: tauri::WebviewWindow, from: (f64, f64), to: (f64, f64), hide_af
 // (push_siblings_back), with delayed insurance passes in case AppKit
 // re-raises them on a later tick.
 //
+// Keying the panel must wait for the activation to actually land
+// (wait_until_active_then_key): activation is asynchronous, and a
+// makeKeyWindow issued before it lands gets overwritten when AppKit's
+// activation transition picks its own key window. Once active, keying is
+// retried a few times and finishes by making the WKWebView (found in the
+// window's view tree) the first responder so DOM focus syncs.
+//
 // If the app is already active (summoned from its own window), no
 // activation is needed — keying the panel is all it takes, and nothing
 // else gets raised.
@@ -633,27 +640,58 @@ fn activate_app_blunt() {
     }
 }
 
-/// Makes the panel the app's key window and first-responder-assigns its
-/// webview, so the focused DOM element (the terminal textarea) gets input
-/// focus. Returns (isKeyWindow, app isActive) right afterwards for tracing.
+/// Finds the window's WKWebView. Usually it is the content view itself,
+/// but window effects can reparent it into a container — search the view
+/// tree if needed.
 #[cfg(target_os = "macos")]
-fn key_panel_window(window: &tauri::WebviewWindow) -> (bool, bool) {
+unsafe fn find_webview(
+    ns_window: *mut objc2::runtime::AnyObject,
+) -> Option<objc2::rc::Retained<objc2::runtime::AnyObject>> {
+    let wk_class = objc2::runtime::AnyClass::get(c"WKWebView")?;
+    let content: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
+        objc2::msg_send![ns_window, contentView];
+    let mut queue = vec![content?];
+    while let Some(view) = queue.pop() {
+        let is_wk: bool = objc2::msg_send![&*view, isKindOfClass: wk_class];
+        if is_wk {
+            return Some(view);
+        }
+        let subs: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
+            objc2::msg_send![&*view, subviews];
+        if let Some(subs) = subs {
+            let count: usize = objc2::msg_send![&*subs, count];
+            for i in 0..count {
+                let sub: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
+                    objc2::msg_send![&*subs, objectAtIndex: i];
+                if let Some(sub) = sub {
+                    queue.push(sub);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Makes the panel the app's key window and first-responder-assigns the
+/// WKWebView, so the focused DOM element (the terminal textarea) gets input
+/// focus. Returns (isKeyWindow, app isActive, firstResponder accepted).
+#[cfg(target_os = "macos")]
+fn key_panel_window(window: &tauri::WebviewWindow) -> (bool, bool, bool) {
     let Some(ns_window) = window.ns_window().ok() else {
-        return (false, false);
+        return (false, false, false);
     };
     let ns_window = ns_window as *mut objc2::runtime::AnyObject;
     unsafe {
         let _: () = objc2::msg_send![ns_window, makeKeyWindow];
-        let content: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
-            objc2::msg_send![ns_window, contentView];
-        if let Some(content) = content {
-            let _: () = objc2::msg_send![ns_window, makeFirstResponder: &*content];
+        let mut fr_ok = false;
+        if let Some(webview) = find_webview(ns_window) {
+            fr_ok = objc2::msg_send![ns_window, makeFirstResponder: &*webview];
         }
         let is_key: bool = objc2::msg_send![ns_window, isKeyWindow];
         let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
             objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
         let is_active: bool = objc2::msg_send![&*nsapp, isActive];
-        (is_key, is_active)
+        (is_key, is_active, fr_ok)
     }
 }
 
@@ -672,6 +710,103 @@ fn key_panel_state(window: &tauri::WebviewWindow) -> (bool, bool, bool) {
         let is_active: bool = objc2::msg_send![&*nsapp, isActive];
         (is_key, is_active, tauri_focus)
     }
+}
+
+/// Waits until the app's activation lands (isActive), then keys the panel
+/// — retrying a few times, because AppKit's asynchronous activation can
+/// hand the key window to a sibling first. Keying MUST happen after
+/// activation: keying while inactive is discarded by the activation
+/// transition itself. Falls back to blunt activation if nothing lands.
+#[cfg(target_os = "macos")]
+fn wait_until_active_then_key(app: AppHandle, window: tauri::WebviewWindow) {
+    tauri::async_runtime::spawn(async move {
+        let mut blunt_issued = false;
+        for tick in 0..48 {
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                focus_debug(&app, "watchdog aborted: panel hidden");
+                return;
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if app
+                .run_on_main_thread(move || {
+                    let active: bool = unsafe {
+                        let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
+                            objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+                        objc2::msg_send![&*nsapp, isActive]
+                    };
+                    let _ = tx.send(active);
+                })
+                .is_err()
+            {
+                return;
+            }
+            let Ok(true) = rx.await else {
+                if tick == 23 && !blunt_issued {
+                    blunt_issued = true;
+                    focus_debug(&app, "activation never landed → blunt activation");
+                    let _ = app.run_on_main_thread(move || {
+                        if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                            unsafe { activate_app_blunt() };
+                        }
+                    });
+                }
+                continue;
+            };
+            // Active: key the panel, retrying while AppKit's activation
+            // settling keeps handing the key state to another window.
+            for attempt in 0..8u32 {
+                if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let w = window.clone();
+                if app
+                    .run_on_main_thread(move || {
+                        if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                            let _ = tx.send((false, false, false));
+                            return;
+                        }
+                        let _ = tx.send(key_panel_window(&w));
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                let Ok((is_key, _, fr_ok)) = rx.await else { return };
+                if is_key {
+                    focus_debug(
+                        &app,
+                        &format!("tick {tick} attempt {attempt}: key granted fr={fr_ok}"),
+                    );
+                    // Recheck shortly after to catch anything stealing the
+                    // key state back.
+                    let recheck = app.clone();
+                    let recheck_window = window.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        if recheck
+                            .run_on_main_thread(move || {
+                                let _ = tx.send(key_panel_state(&recheck_window));
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if let Ok((k, a, f)) = rx.await {
+                            focus_debug(&app, &format!("recheck: key={k} act={a} f={f}"));
+                        }
+                    });
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            focus_debug(&app, "keying failed after retries");
+            return;
+        }
+        focus_debug(&app, "gave up: app never became active within 720ms");
+    });
 }
 
 /// Pushes every visible, non-fullscreen app window other than `panel` to
@@ -749,56 +884,57 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
                 focus_debug(&app, &format!("activated; pushed {pushed} siblings back"));
             }
         }
-        let (is_key, is_active) = key_panel_window(&w);
-        focus_debug(&app, &format!("keyed: is_key={is_key} active={is_active}"));
-        if !is_key {
-            // Should not happen; last-resort escalation.
-            focus_debug(&app, "key not granted -> blunt activation + re-key");
-            unsafe { activate_app_blunt() };
-            let (is_key2, active2) = key_panel_window(&w);
-            focus_debug(&app, &format!("after blunt: key={is_key2} active={active2}"));
+        if app_active {
+            // Summoned while this app is already frontmost: keying now is
+            // safe (the app is active) and nothing else gets raised.
+            let (is_key, is_active, fr_ok) = key_panel_window(&w);
+            focus_debug(
+                &app,
+                &format!("already-active: key={is_key} act={is_active} fr={fr_ok}"),
+            );
+            return;
         }
-        if !app_active {
-            // Insurance: if AppKit re-raises the siblings on a later
-            // runloop tick, push them back once more, then log the final
-            // state (this is also the diagnostic recheck).
-            let app2 = app.clone();
-            let w2 = w.clone();
-            tauri::async_runtime::spawn(async move {
-                for delay_ms in [100u64, 300] {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
-                        return;
-                    }
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let w3 = w2.clone();
-                    if app2
-                        .run_on_main_thread(move || {
-                            let mut pushed = 0usize;
-                            if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
-                                if let Ok(ns) = w3.ns_window() {
-                                    pushed = unsafe {
-                                        push_siblings_back(ns as *mut objc2::runtime::AnyObject)
-                                    };
-                                }
-                            }
-                            let _ = tx.send((pushed, key_panel_state(&w3)));
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if let Ok((pushed, (is_key, is_active, focus))) = rx.await {
-                        focus_debug(
-                            &app2,
-                            &format!(
-                                "{delay_ms}ms push={pushed} key={is_key} act={is_active} f={focus}"
-                            ),
-                        );
-                    }
+        // Keying must wait for the activation to land; activation is
+        // asynchronous and keys the panel too early get overwritten by it.
+        let app2 = app.clone();
+        let w2 = w.clone();
+        wait_until_active_then_key(app, w);
+        // Insurance: if AppKit re-raises the siblings on a later runloop
+        // tick, push them back once more.
+        tauri::async_runtime::spawn(async move {
+            for delay_ms in [100u64, 300] {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
                 }
-            });
-        }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let w3 = w2.clone();
+                if app2
+                    .run_on_main_thread(move || {
+                        let mut pushed = 0usize;
+                        if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                            if let Ok(ns) = w3.ns_window() {
+                                pushed = unsafe {
+                                    push_siblings_back(ns as *mut objc2::runtime::AnyObject)
+                                };
+                            }
+                        }
+                        let _ = tx.send((pushed, key_panel_state(&w3)));
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if let Ok((pushed, (is_key, is_active, focus))) = rx.await {
+                    focus_debug(
+                        &app2,
+                        &format!(
+                            "{delay_ms}ms push={pushed} key={is_key} act={is_active} f={focus}"
+                        ),
+                    );
+                }
+            }
+        });
     });
 }
 
