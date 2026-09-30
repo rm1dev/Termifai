@@ -707,6 +707,8 @@ fn wait_for_activation_then_key(
                 // Activation landed: now key the panel so becomeKeyWindow is
                 // delivered and AppKit/WKWebView focus state converges.
                 let logger = app.clone();
+                // Clone BEFORE the closure below moves `window`.
+                let recheck_window = window.clone();
                 let _ = app.run_on_main_thread(move || {
                     if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
                         return;
@@ -716,11 +718,21 @@ fn wait_for_activation_then_key(
                         &logger,
                         &format!("tick {tick}: keyed is_key={is_key} active={is_active}"),
                     );
+                    if !is_key {
+                        // The panel refused/refused the key state — force
+                        // full activation and try once more.
+                        focus_debug(&logger, "key not granted -> blunt activation + re-key");
+                        activate_app_blunt();
+                        let (is_key2, active2) = key_panel_window(&window);
+                        focus_debug(
+                            &logger,
+                            &format!("after blunt: key={is_key2} active={active2}"),
+                        );
+                    }
                 });
                 // Re-check shortly after: catches anything that steals the
                 // key state back right after we set it.
                 let recheck = app.clone();
-                let recheck_window = window.clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     let (tx, rx) = tokio::sync::oneshot::channel();
