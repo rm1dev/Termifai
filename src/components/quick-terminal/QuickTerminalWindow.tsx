@@ -29,6 +29,22 @@ export function QuickTerminalWindow() {
   const [opacity, setOpacity] = useState(1);
   const dragState = useRef<{ pointerId: number; raf: number; lastSize: number } | null>(null);
 
+  // TEMPORARY focus diagnostics (panel-focus bug): show the page's real
+  // focus state so we can tell native-window desync from an xterm issue.
+  // Remove once the bug is resolved.
+  const [pageFocused, setPageFocused] = useState(() => document.hasFocus());
+  useEffect(() => {
+    const update = () => setPageFocused(document.hasFocus());
+    const id = window.setInterval(update, 250);
+    window.addEventListener("focus", update);
+    window.addEventListener("blur", update);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", update);
+      window.removeEventListener("blur", update);
+    };
+  }, []);
+
   // The native window is transparent; the page must be too, or the webview
   // paints an opaque rectangle over the native blur layer. index.html's
   // anti-flash <style> puts an opaque background on html, body AND #root,
@@ -171,6 +187,14 @@ export function QuickTerminalWindow() {
               quickTerminalEdge={edge}
             />
           )}
+        </div>
+
+        {/* TEMPORARY focus diagnostics — remove with the state above. */}
+        <div
+          className="pointer-events-none absolute right-1 top-0 z-50 font-mono text-[9px] leading-4"
+          style={{ color: pageFocused ? "#4ade80" : "#f87171", opacity: 0.85 }}
+        >
+          focus:{pageFocused ? "YES" : "NO"}
         </div>
 
         <div

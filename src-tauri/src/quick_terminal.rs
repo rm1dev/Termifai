@@ -518,13 +518,21 @@ fn slide(window: tauri::WebviewWindow, from: (f64, f64), to: (f64, f64), hide_af
 //    to the *active* app, so a merely key window of an inactive app cannot
 //    receive input.
 //
-// The fix activates the app but asks the WindowServer to raise ONLY the
-// panel: `_SLPSSetFrontProcessWithOptions(psn, wid, user_generated)` — the
-// same mechanism window switchers (AltTab, yabai) use to focus a single
-// window of an app. The user-generated flag is accurate (the switch
-// originates from the user's hotkey press) and keeps macOS 14+ cooperative
-// activation from suppressing the request. If that mechanism is unavailable
-// or gets refused, `wait_for_activation_then_key` falls back to plain
+// The fix activates the app through the official Carbon Process Manager
+// (`SetFrontProcessWithOptions` + kSetFrontProcessFrontWindowOnly) so that
+// only ONE window comes forward. For that one window to be the panel, the
+// panel is temporarily demoted from the floating level to the normal level
+// right before the call (frontWindowOnly raises the frontmost NON-FLOATING
+// window) and restored to its original level once activation lands. The
+// app's other windows are never raised.
+//
+// (An earlier revision used the private `_SLPSSetFrontProcessWithOptions`
+// with the panel's window id. It routed keystrokes but left AppKit's
+// activation/key bookkeeping out of sync — no becomeKeyWindow, no cursor
+// blink, no blur on click-away. The Carbon path performs the full official
+// activation handshake, which is what AppKit/WKWebView need.)
+//
+// If Carbon is refused, `wait_for_activation_then_key` falls back to plain
 // activation — the pre-fix behaviour, which guarantees focus at the cost of
 // possibly raising sibling windows.
 //
@@ -545,10 +553,34 @@ struct ProcessSerialNumber {
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
     fn GetProcessForPID(pid: std::ffi::c_int, psn: *mut ProcessSerialNumber) -> std::ffi::c_int;
+    fn SetFrontProcessWithOptions(
+        psn: *const ProcessSerialNumber,
+        options: u32,
+    ) -> std::ffi::c_int;
+}
+
+/// Activates this app through the official Carbon Process Manager, asking that
+/// only the app's frontmost NON-FLOATING window come forward. The panel is
+/// temporarily demoted to the normal window level before this call (see
+/// focus_panel_macos), so that frontmost window is the panel itself — the
+/// app's other windows are never raised. Returns false if the switch was
+/// refused. Unlike the private SkyLight front-switch, this goes through the
+/// full official activation handshake, so AppKit's activation/key-window
+/// bookkeeping (becomeKeyWindow, WKWebView focus sync, blur on click-away)
+/// actually takes place.
+#[cfg(target_os = "macos")]
+fn carbon_activate_front_window_only() -> bool {
+    // kCurrentProcess
+    const K_CURRENT_PROCESS: ProcessSerialNumber = ProcessSerialNumber { hi: 0, lo: 2 };
+    // kSetFrontProcessFrontWindowOnly
+    const FRONT_WINDOW_ONLY: u32 = 1;
+    unsafe { SetFrontProcessWithOptions(&K_CURRENT_PROCESS, FRONT_WINDOW_ONLY) == 0 }
 }
 
 /// Switches the front process to this app asking the WindowServer to raise
-/// only `window_id`. Returns false when the mechanism is unavailable.
+/// only `window_id`. KEPT AS A RESERVE: it routes keystrokes but leaves
+/// AppKit focus bookkeeping out of sync (no cursor blink / no blur).
+#[allow(dead_code)]
 #[cfg(target_os = "macos")]
 fn front_switch_raising_only(window_id: u32) -> bool {
     type SlpsSetFrontProcess =
@@ -669,24 +701,42 @@ fn key_panel_state(window: &tauri::WebviewWindow) -> (bool, bool, bool) {
     }
 }
 
-/// Waits for the app's activation to land, then makes the panel the key
-/// window. The keying MUST happen after activation: keying a window of an
-/// inactive app records the key state without ever delivering the
-/// becomeKeyWindow transition, leaving AppKit/WKWebView convinced the
-/// webview is unfocused even though keystrokes reach it (no cursor blink,
-/// no blur on click-away). If the targeted front-switch never lands within
-/// the grace period, falls back to plain activation and still waits for it.
+/// Restores the panel's window level (it is demoted to the normal level
+/// around the front-window-only activation call — see focus_panel_macos).
+#[cfg(target_os = "macos")]
+fn restore_panel_level(window: &tauri::WebviewWindow, level: i64) {
+    if let Ok(ns_window) = window.ns_window() {
+        let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+        unsafe {
+            let _: () = objc2::msg_send![ns_window, setLevel: level];
+        }
+    }
+}
+
+/// Waits for the app's activation to land, then restores the panel's window
+/// level and makes it the key window. The keying MUST happen after
+/// activation: keying a window of an inactive app records the key state
+/// without ever delivering the becomeKeyWindow transition, leaving
+/// AppKit/WKWebView convinced the webview is unfocused even though
+/// keystrokes reach it (no cursor blink, no blur on click-away). If the
+/// activation never lands within the grace period, falls back to plain
+/// activation and still waits for it.
 #[cfg(target_os = "macos")]
 fn wait_for_activation_then_key(
     app: AppHandle,
     window: tauri::WebviewWindow,
     mut blunt_issued: bool,
+    restore_level: Option<i64>,
 ) {
     tauri::async_runtime::spawn(async move {
         for tick in 0..48 {
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
                 focus_debug(&app, "watchdog aborted: panel hidden");
+                if let Some(level) = restore_level {
+                    let w = window.clone();
+                    let _ = app.run_on_main_thread(move || restore_panel_level(&w, level));
+                }
                 return; // Panel dismissed in the meantime.
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -704,8 +754,9 @@ fn wait_for_activation_then_key(
                 return;
             }
             if let Ok(true) = rx.await {
-                // Activation landed: now key the panel so becomeKeyWindow is
-                // delivered and AppKit/WKWebView focus state converges.
+                // Activation landed: restore the panel's level and key it so
+                // becomeKeyWindow is delivered and AppKit/WKWebView focus
+                // state converges.
                 let logger = app.clone();
                 // Clone BEFORE the closure below moves `window`.
                 let recheck_window = window.clone();
@@ -713,14 +764,19 @@ fn wait_for_activation_then_key(
                     if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
                         return;
                     }
+                    if let Some(level) = restore_level {
+                        restore_panel_level(&window, level);
+                    }
                     let (is_key, is_active) = key_panel_window(&window);
                     focus_debug(
                         &logger,
-                        &format!("tick {tick}: keyed is_key={is_key} active={is_active}"),
+                        &format!(
+                            "tick {tick}: level restored, keyed is_key={is_key} active={is_active}"
+                        ),
                     );
                     if !is_key {
-                        // The panel refused/refused the key state — force
-                        // full activation and try once more.
+                        // The panel refused the key state — force full
+                        // activation and try once more.
                         focus_debug(&logger, "key not granted -> blunt activation + re-key");
                         activate_app_blunt();
                         let (is_key2, active2) = key_panel_window(&window);
@@ -754,12 +810,12 @@ fn wait_for_activation_then_key(
                 return;
             }
             if tick == 23 && !blunt_issued {
-                // The targeted front-switch never landed — fall back to the
-                // blunt activation (pre-fix behaviour: focus guaranteed, may
-                // raise sibling windows), then keep waiting to key the panel.
+                // The activation never landed — fall back to the blunt
+                // activation (pre-fix behaviour: focus guaranteed, may raise
+                // sibling windows), then keep waiting to key the panel.
                 blunt_issued = true;
                 let logger = app.clone();
-                focus_debug(&logger, "front-switch never landed → fallback blunt activation");
+                focus_debug(&logger, "activation never landed → fallback blunt activation");
                 let _ = app.run_on_main_thread(move || {
                     if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
                         activate_app_blunt();
@@ -768,6 +824,9 @@ fn wait_for_activation_then_key(
             }
         }
         focus_debug(&app, "gave up: app never became active within 720ms");
+        if let Some(level) = restore_level {
+            let _ = app.run_on_main_thread(move || restore_panel_level(&window, level));
+        }
     });
 }
 
@@ -783,22 +842,11 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
                 objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
             objc2::msg_send![&*nsapp, isActive]
         };
-        let window_id = if let Ok(ns_window) = w.ns_window() {
-            let ns_window = ns_window as *mut objc2::runtime::AnyObject;
-            unsafe {
-                // Frontmost first, so a front-window-only switch raises the
-                // panel and not the app's other windows. Deliberately NOT
-                // makeKeyWindow here while the app is inactive — see
-                // wait_for_activation_then_key.
-                let _: () = objc2::msg_send![ns_window, orderFrontRegardless];
-                let wid: i64 = objc2::msg_send![ns_window, windowNumber];
-                Some(wid as u32)
-            }
-        } else {
+        let panel = w.ns_window().ok().map(|p| p as *mut objc2::runtime::AnyObject);
+        let Some(ns_window) = panel else {
             focus_debug(&app, "show: ns_window unavailable");
-            None
+            return;
         };
-        focus_debug(&app, &format!("show: app_active={app_active} wid={window_id:?}"));
         if app_active {
             // Summoned while this app was already frontmost (e.g. from the
             // main window or tray): keying the panel is all it takes — the
@@ -811,18 +859,44 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
             );
             return;
         }
-        let Some(window_id) = window_id else {
-            return;
+        // Frontmost first, so the front-window-only activation raises the
+        // panel and not the app's other windows. Deliberately NOT
+        // makeKeyWindow here while the app is inactive — see
+        // wait_for_activation_then_key.
+        let (original_level, window_id) = unsafe {
+            let level: i64 = objc2::msg_send![ns_window, level];
+            let wid: i64 = objc2::msg_send![ns_window, windowNumber];
+            (level, wid as u32)
         };
+        unsafe {
+            // Demote the panel to the normal level for the activation call:
+            // kSetFrontProcessFrontWindowOnly raises the frontmost
+            // NON-FLOATING window, so this makes that window the panel and
+            // guarantees siblings stay put. Restored once activation lands
+            // (or on any exit path of the watchdog).
+            let _: () = objc2::msg_send![ns_window, setLevel: 0i64];
+            let _: () = objc2::msg_send![ns_window, orderFrontRegardless];
+        }
+        let mut restore_level = Some(original_level);
+        focus_debug(
+            &app,
+            &format!("show: active={app_active} wid={window_id} level {original_level}→0"),
+        );
         let mut blunt_issued = false;
-        if front_switch_raising_only(window_id) {
-            focus_debug(&app, &format!("slps front-switch issued for wid={window_id}"));
+        if carbon_activate_front_window_only() {
+            focus_debug(&app, "carbon front-window-only activation issued");
         } else {
-            focus_debug(&app, "slps unavailable → immediate blunt activation");
+            // Carbon refused — undo the demotion and fall back to plain
+            // activation (pre-fix behaviour, may raise siblings).
+            unsafe {
+                let _: () = objc2::msg_send![ns_window, setLevel: original_level];
+            }
+            restore_level = None;
+            focus_debug(&app, "carbon refused → demotion undone + blunt activation");
             activate_app_blunt();
             blunt_issued = true;
         }
-        wait_for_activation_then_key(app, w, blunt_issued);
+        wait_for_activation_then_key(app, w, blunt_issued, restore_level);
     });
 }
 
