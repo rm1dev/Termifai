@@ -747,7 +747,7 @@ fn wait_until_active_then_key(app: AppHandle, window: tauri::WebviewWindow) {
                     focus_debug(&app, "activation never landed → blunt activation");
                     let _ = app.run_on_main_thread(move || {
                         if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
-                            unsafe { activate_app_blunt() };
+                            activate_app_blunt();
                         }
                     });
                 }
@@ -975,9 +975,10 @@ pub fn resync_window_webview_focus(app: &AppHandle, window: tauri::WebviewWindow
         for delay_ms in [250u64, 800] {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             let (tx, rx) = tokio::sync::oneshot::channel();
+            let w = window.clone();
             if app
                 .run_on_main_thread(move || {
-                    let _ = tx.send(resync_window_webview_focus_once(&window));
+                    let _ = tx.send(resync_window_webview_focus_once(&w));
                 })
                 .is_err()
             {
