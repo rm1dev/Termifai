@@ -5,6 +5,7 @@ import {
   getQuickTerminalInfo,
   hideQuickTerminal,
   quickTerminalFrontendReady,
+  refocusQuickTerminalWebview,
   resizeQuickTerminal,
   type QuickTerminalEdge,
 } from "@/lib/api/quick-terminal";
@@ -33,8 +34,30 @@ export function QuickTerminalWindow() {
   // focus state so we can tell native-window desync from an xterm issue.
   // Remove once the bug is resolved.
   const [pageFocused, setPageFocused] = useState(() => document.hasFocus());
+  // Cold-launch race: the panel can be natively keyed before this webview
+  // finishes loading, leaving the DOM unfocused afterwards. Track whether
+  // focus ever arrived since the last show, and while it hasn't, ask the
+  // backend to re-assert the key state / webview first responder.
+  const lastShowAt = useRef(0);
+  const lastRefocusAt = useRef(0);
+  const hadFocusSinceShow = useRef(true);
   useEffect(() => {
-    const update = () => setPageFocused(document.hasFocus());
+    const update = () => {
+      const focused = document.hasFocus();
+      setPageFocused(focused);
+      if (focused) {
+        hadFocusSinceShow.current = true;
+        return;
+      }
+      if (
+        !hadFocusSinceShow.current &&
+        Date.now() - lastShowAt.current < 5000 &&
+        Date.now() - lastRefocusAt.current > 1000
+      ) {
+        lastRefocusAt.current = Date.now();
+        void refocusQuickTerminalWebview().catch(() => {});
+      }
+    };
     const id = window.setInterval(update, 250);
     window.addEventListener("focus", update);
     window.addEventListener("blur", update);
@@ -79,6 +102,8 @@ export function QuickTerminalWindow() {
         await subscribe<{ edge: QuickTerminalEdge }>("quick-terminal:show", (event) => {
           setEdge(event.payload.edge);
           setHasOpened(true);
+          lastShowAt.current = Date.now();
+          hadFocusSinceShow.current = false;
         }),
       );
       push(

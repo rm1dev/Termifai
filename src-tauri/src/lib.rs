@@ -70,6 +70,7 @@ enum TransferResumeSignal {
 use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
 use quick_terminal::{
     get_quick_terminal_info, hide_quick_terminal, quick_terminal_frontend_ready,
+    refocus_quick_terminal_webview,
     resize_quick_terminal, set_quick_terminal_edge, set_quick_terminal_enabled,
     set_quick_terminal_opacity, toggle_quick_terminal,
 };
@@ -2753,6 +2754,7 @@ pub fn run() {
             set_quick_terminal_enabled,
             set_quick_terminal_opacity,
             quick_terminal_frontend_ready,
+            refocus_quick_terminal_webview,
         ])
         .on_window_event(|window, event| {
             // Closing the main/extra windows hides them rather than exiting the

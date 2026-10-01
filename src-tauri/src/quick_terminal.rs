@@ -1234,6 +1234,36 @@ pub fn hide_quick_terminal(app: AppHandle) {
     }
 }
 
+/// Re-asserts the panel's key state and the webview's first-responder
+/// status. The frontend calls this shortly after a show while the DOM still
+/// reports no focus — a cold-launch race: the panel gets keyed before its
+/// webview finishes loading, and the finished load resets WKWebView's focus
+/// state with nothing around to re-sync it.
+#[tauri::command]
+pub fn refocus_quick_terminal_webview(app: AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(window) = app.get_webview_window(WINDOW_LABEL) else {
+            return;
+        };
+        let logger = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let (is_key, _, fr_ok) = key_panel_window(&window);
+            focus_debug(&logger, &format!("frontend refocus: key={is_key} fr={fr_ok}"));
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+    }
+}
+
 /// Live-resizes the panel while the in-panel handle is dragged. `size` is the
 /// new value of the resizable dimension in physical pixels. `commit` persists
 /// the size for the current edge (sent on pointer-up).
