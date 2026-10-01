@@ -2570,6 +2570,14 @@ pub fn run() {
                         if all_finished {
                             launch_activity::end();
                         }
+                        // A window made key before its page finished loading
+                        // ends up focused-but-unfocused: the finished load
+                        // resets WKWebView's focus state. Re-assert the
+                        // webview as first responder shortly after the load
+                        // (only if the window is key — never steals focus).
+                        if let Some(window) = app.get_webview_window(webview.label()) {
+                            quick_terminal::resync_window_webview_focus(app, window);
+                        }
                     }
                 }
             }
@@ -3003,6 +3011,13 @@ pub fn run() {
             let quick_terminal_window = qt_builder.visible(false).build()?;
             let quick_terminal_handle = app.handle().clone();
             quick_terminal_window.on_window_event(move |event| {
+                #[cfg(target_os = "macos")]
+                if let tauri::WindowEvent::Focused(focused) = event {
+                    quick_terminal::focus_debug(
+                        &quick_terminal_handle,
+                        &format!("panel Focused({focused})"),
+                    );
+                }
                 if !matches!(event, tauri::WindowEvent::Focused(false)) {
                     return;
                 }
