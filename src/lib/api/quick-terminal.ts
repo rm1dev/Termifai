@@ -55,15 +55,6 @@ export function hideQuickTerminal(): Promise<void> {
 }
 
 /**
- * Re-asserts the panel's native key state + webview first responder. Used
- * shortly after a show when the DOM still reports no focus (cold-launch
- * race: the page finished loading after the native window was keyed).
- */
-export function refocusQuickTerminalWebview(): Promise<void> {
-  return call<void>("refocus_quick_terminal_webview");
-}
-
-/**
  * Live-resize during handle drag. `size` is the new physical-pixel value of
  * the resizable dimension; `commit: true` (pointer-up) persists it per edge.
  */

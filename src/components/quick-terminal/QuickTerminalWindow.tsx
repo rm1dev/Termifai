@@ -5,7 +5,6 @@ import {
   getQuickTerminalInfo,
   hideQuickTerminal,
   quickTerminalFrontendReady,
-  refocusQuickTerminalWebview,
   resizeQuickTerminal,
   type QuickTerminalEdge,
 } from "@/lib/api/quick-terminal";
@@ -29,44 +28,6 @@ export function QuickTerminalWindow() {
   const [hasOpened, setHasOpened] = useState(false);
   const [opacity, setOpacity] = useState(1);
   const dragState = useRef<{ pointerId: number; raf: number; lastSize: number } | null>(null);
-
-  // TEMPORARY focus diagnostics (panel-focus bug): show the page's real
-  // focus state so we can tell native-window desync from an xterm issue.
-  // Remove once the bug is resolved.
-  const [pageFocused, setPageFocused] = useState(() => document.hasFocus());
-  // Cold-launch race: the panel can be natively keyed before this webview
-  // finishes loading, leaving the DOM unfocused afterwards. Track whether
-  // focus ever arrived since the last show, and while it hasn't, ask the
-  // backend to re-assert the key state / webview first responder.
-  const lastShowAt = useRef(0);
-  const lastRefocusAt = useRef(0);
-  const hadFocusSinceShow = useRef(true);
-  useEffect(() => {
-    const update = () => {
-      const focused = document.hasFocus();
-      setPageFocused(focused);
-      if (focused) {
-        hadFocusSinceShow.current = true;
-        return;
-      }
-      if (
-        !hadFocusSinceShow.current &&
-        Date.now() - lastShowAt.current < 5000 &&
-        Date.now() - lastRefocusAt.current > 1000
-      ) {
-        lastRefocusAt.current = Date.now();
-        void refocusQuickTerminalWebview().catch(() => {});
-      }
-    };
-    const id = window.setInterval(update, 250);
-    window.addEventListener("focus", update);
-    window.addEventListener("blur", update);
-    return () => {
-      window.clearInterval(id);
-      window.removeEventListener("focus", update);
-      window.removeEventListener("blur", update);
-    };
-  }, []);
 
   // The native window is transparent; the page must be too, or the webview
   // paints an opaque rectangle over the native blur layer. index.html's
@@ -102,8 +63,6 @@ export function QuickTerminalWindow() {
         await subscribe<{ edge: QuickTerminalEdge }>("quick-terminal:show", (event) => {
           setEdge(event.payload.edge);
           setHasOpened(true);
-          lastShowAt.current = Date.now();
-          hadFocusSinceShow.current = false;
         }),
       );
       push(
@@ -212,14 +171,6 @@ export function QuickTerminalWindow() {
               quickTerminalEdge={edge}
             />
           )}
-        </div>
-
-        {/* TEMPORARY focus diagnostics — remove with the state above. */}
-        <div
-          className="pointer-events-none absolute right-1 top-0 z-50 font-mono text-[9px] leading-4"
-          style={{ color: pageFocused ? "#4ade80" : "#f87171", opacity: 0.85 }}
-        >
-          focus:{pageFocused ? "YES" : "NO"}
         </div>
 
         <div

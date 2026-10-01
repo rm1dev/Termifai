@@ -70,7 +70,6 @@ enum TransferResumeSignal {
 use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
 use quick_terminal::{
     get_quick_terminal_info, hide_quick_terminal, quick_terminal_frontend_ready,
-    refocus_quick_terminal_webview,
     resize_quick_terminal, set_quick_terminal_edge, set_quick_terminal_enabled,
     set_quick_terminal_opacity, toggle_quick_terminal,
 };
@@ -2571,6 +2570,14 @@ pub fn run() {
                         if all_finished {
                             launch_activity::end();
                         }
+                        // A window made key before its page finished loading
+                        // ends up focused-but-unfocused: the finished load
+                        // resets WKWebView's focus state. Re-assert the
+                        // webview as first responder shortly after the load
+                        // (only if the window is key — never steals focus).
+                        if let Some(window) = app.get_webview_window(webview.label()) {
+                            quick_terminal::resync_window_webview_focus(app, window);
+                        }
                     }
                 }
             }
@@ -2754,7 +2761,6 @@ pub fn run() {
             set_quick_terminal_enabled,
             set_quick_terminal_opacity,
             quick_terminal_frontend_ready,
-            refocus_quick_terminal_webview,
         ])
         .on_window_event(|window, event| {
             // Closing the main/extra windows hides them rather than exiting the

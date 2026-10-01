@@ -942,6 +942,54 @@ fn schedule_sibling_pushback_at_idle(panel: *mut objc2::runtime::AnyObject) {
     }
 }
 
+/// Re-asserts `window`'s webview as first responder, but ONLY when the
+/// window is already key — never steals focus. Returns false when the
+/// window isn't key (nothing to sync).
+#[cfg(target_os = "macos")]
+fn resync_window_webview_focus_once(window: &tauri::WebviewWindow) -> bool {
+    if !window.is_focused().unwrap_or(false) {
+        return false;
+    }
+    let Some(ns_window) = window.ns_window().ok() else {
+        return false;
+    };
+    let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+    unsafe {
+        if let Some(webview) = find_webview(ns_window) {
+            let _: bool = objc2::msg_send![ns_window, makeFirstResponder: &*webview];
+        }
+    }
+    true
+}
+
+/// WKWebView drops its focus-controller state when its page finishes
+/// loading after the window was already made key: the window is focused
+/// but the page reports no focus (no cursor blink in a cold-launched
+/// window). Re-asserts the webview as first responder shortly after the
+/// load, twice, so it also lands after the frontend has focused its own
+/// elements (e.g. the terminal).
+#[cfg(target_os = "macos")]
+pub fn resync_window_webview_focus(app: &AppHandle, window: tauri::WebviewWindow) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for delay_ms in [250u64, 800] {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if app
+                .run_on_main_thread(move || {
+                    let _ = tx.send(resync_window_webview_focus_once(&window));
+                })
+                .is_err()
+            {
+                return;
+            }
+            if !matches!(rx.await, Ok(true)) {
+                return; // Window not (anymore) key — nothing to sync.
+            }
+        }
+    });
+}
+
 /// Keyboard-focus the panel on macOS. Must be called for a panel that was
 /// just shown; see the module-section comment above for the full rationale.
 #[cfg(target_os = "macos")]
@@ -1231,36 +1279,6 @@ pub fn hide_quick_terminal(app: AppHandle) {
         {
             hide_panel(&app, window, &settings);
         }
-    }
-}
-
-/// Re-asserts the panel's key state and the webview's first-responder
-/// status. The frontend calls this shortly after a show while the DOM still
-/// reports no focus — a cold-launch race: the panel gets keyed before its
-/// webview finishes loading, and the finished load resets WKWebView's focus
-/// state with nothing around to re-sync it.
-#[tauri::command]
-pub fn refocus_quick_terminal_webview(app: AppHandle) {
-    #[cfg(target_os = "macos")]
-    {
-        if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        let Some(window) = app.get_webview_window(WINDOW_LABEL) else {
-            return;
-        };
-        let logger = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            let (is_key, _, fr_ok) = key_panel_window(&window);
-            focus_debug(&logger, &format!("frontend refocus: key={is_key} fr={fr_ok}"));
-        });
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = app;
     }
 }
 
