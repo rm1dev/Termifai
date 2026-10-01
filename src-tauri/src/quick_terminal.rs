@@ -773,7 +773,9 @@ fn wait_until_active_then_key(app: AppHandle, window: tauri::WebviewWindow) {
                 {
                     return;
                 }
-                let Ok((is_key, _, fr_ok)) = rx.await else { return };
+                let Ok((is_key, _, fr_ok)) = rx.await else {
+                    return;
+                };
                 if is_key {
                     focus_debug(
                         &app,
@@ -815,7 +817,9 @@ unsafe fn nsstring_to_string(obj: &objc2::runtime::AnyObject) -> String {
     if utf8.is_null() {
         return String::new();
     }
-    std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+    std::ffi::CStr::from_ptr(utf8)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Pushes every visible, non-fullscreen app window other than `panel` to
@@ -1003,7 +1007,10 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
                 objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
             objc2::msg_send![&*nsapp, isActive]
         };
-        let Some(ns_window) = w.ns_window().ok().map(|p| p as *mut objc2::runtime::AnyObject)
+        let Some(ns_window) = w
+            .ns_window()
+            .ok()
+            .map(|p| p as *mut objc2::runtime::AnyObject)
         else {
             focus_debug(&app, "show: ns_window unavailable");
             return;
@@ -1064,10 +1071,7 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
                         if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
                             if let Ok(ns) = w3.ns_window() {
                                 let (p, _) = unsafe {
-                                    push_siblings_back(
-                                        ns as *mut objc2::runtime::AnyObject,
-                                        false,
-                                    )
+                                    push_siblings_back(ns as *mut objc2::runtime::AnyObject, false)
                                 };
                                 pushed = p;
                             }

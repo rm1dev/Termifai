@@ -1,6 +1,6 @@
 [package]
 name = "Termifaid"
-version = "1.2.0"
+version = "1.2.1"
 description = "Termifai hotkey service: listens for global hotkeys and launches/toggles the app, surviving app quit"
 edition = "2021"
 license = "MIT"
