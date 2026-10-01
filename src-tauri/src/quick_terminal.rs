@@ -809,21 +809,35 @@ fn wait_until_active_then_key(app: AppHandle, window: tauri::WebviewWindow) {
     });
 }
 
+#[cfg(target_os = "macos")]
+unsafe fn nsstring_to_string(obj: &objc2::runtime::AnyObject) -> String {
+    let utf8: *const std::ffi::c_char = objc2::msg_send![obj, UTF8String];
+    if utf8.is_null() {
+        return String::new();
+    }
+    std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+}
+
 /// Pushes every visible, non-fullscreen app window other than `panel` to
 /// the back of its window level. Activating the app raises ALL of the app's
-/// windows (since Big Sur); doing this in the same runloop turn as the
-/// activation keeps the raise invisible. Returns how many were pushed.
+/// windows (since Big Sur); doing this around the activation keeps the
+/// raise invisible. Returns how many were pushed (and, when asked, their
+/// titles for diagnostics).
 #[cfg(target_os = "macos")]
-unsafe fn push_siblings_back(panel: *mut objc2::runtime::AnyObject) -> usize {
+unsafe fn push_siblings_back(
+    panel: *mut objc2::runtime::AnyObject,
+    collect_titles: bool,
+) -> (usize, Vec<String>) {
     let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
         objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
     let windows: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
         objc2::msg_send![&*nsapp, windows];
     let Some(windows) = windows else {
-        return 0;
+        return (0, Vec::new());
     };
     let count: usize = objc2::msg_send![&*windows, count];
     let mut pushed = 0usize;
+    let mut titles = Vec::new();
     for i in 0..count {
         let win: *mut objc2::runtime::AnyObject = objc2::msg_send![&*windows, objectAtIndex: i];
         if win.is_null() || win == panel {
@@ -839,10 +853,93 @@ unsafe fn push_siblings_back(panel: *mut objc2::runtime::AnyObject) -> usize {
         if mask & (1 << 14) != 0 {
             continue;
         }
+        if collect_titles {
+            let title: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> =
+                objc2::msg_send![win, title];
+            titles.push(
+                title
+                    .as_deref()
+                    .map(|t| unsafe { nsstring_to_string(t) })
+                    .unwrap_or_default(),
+            );
+        }
         let _: () = objc2::msg_send![win, orderBack: &*win];
         pushed += 1;
     }
-    pushed
+    (pushed, titles)
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
+    fn CFRunLoopAddObserver(
+        rl: *mut std::ffi::c_void,
+        observer: *mut std::ffi::c_void,
+        mode: *const std::ffi::c_void,
+    );
+    fn CFRunLoopObserverCreate(
+        allocator: *const std::ffi::c_void,
+        activities: u64,
+        repeats: u8,
+        order: i64,
+        callout: unsafe extern "C" fn(*mut std::ffi::c_void, u64, *mut std::ffi::c_void),
+        context: *const CFRunLoopObserverContext,
+    ) -> *mut std::ffi::c_void;
+    fn CFRelease(cf: *const std::ffi::c_void);
+    static kCFRunLoopCommonModes: *const std::ffi::c_void;
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[rustfmt::skip]
+struct CFRunLoopObserverContext {
+    version: i64,
+    info: *mut std::ffi::c_void,
+    retain: Option<unsafe extern "C" fn(*const std::ffi::c_void) -> *const std::ffi::c_void>,
+    release: Option<unsafe extern "C" fn(*const std::ffi::c_void)>,
+    copy_description: Option<unsafe extern "C" fn(*const std::ffi::c_void) -> *const std::ffi::c_void>,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn push_siblings_back_at_idle(
+    _observer: *mut std::ffi::c_void,
+    _activity: u64,
+    info: *mut std::ffi::c_void,
+) {
+    push_siblings_back(info as *mut objc2::runtime::AnyObject, false);
+}
+
+/// Pushes the siblings back once more right before the main runloop goes
+/// idle — i.e. after every callback AppKit queued for this activation
+/// cycle (including its DEFERRED window raising), so the raise is undone
+/// within the same display frame and never becomes visible.
+#[cfg(target_os = "macos")]
+fn schedule_sibling_pushback_at_idle(panel: *mut objc2::runtime::AnyObject) {
+    const K_CF_RUN_LOOP_BEFORE_WAITING: u64 = 1 << 5;
+    unsafe {
+        let context = CFRunLoopObserverContext {
+            version: 0,
+            info: panel as *mut std::ffi::c_void,
+            retain: None,
+            release: None,
+            copy_description: None,
+        };
+        let observer = CFRunLoopObserverCreate(
+            std::ptr::null(),
+            K_CF_RUN_LOOP_BEFORE_WAITING,
+            0,
+            0,
+            push_siblings_back_at_idle,
+            &context,
+        );
+        if observer.is_null() {
+            return;
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
+        // The runloop holds its own reference now.
+        CFRelease(observer);
+    }
 }
 
 /// Keyboard-focus the panel on macOS. Must be called for a panel that was
@@ -880,8 +977,11 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
                 let nsapp: objc2::rc::Retained<objc2::runtime::AnyObject> =
                     objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
                 let _: () = objc2::msg_send![&*nsapp, activateIgnoringOtherApps: true];
-                let pushed = push_siblings_back(ns_window);
-                focus_debug(&app, &format!("activated; pushed {pushed} siblings back"));
+                let (pushed, titles) = push_siblings_back(ns_window, true);
+                focus_debug(&app, &format!("activated; pushed {pushed}: {titles:?}"));
+                // Undo AppKit's DEFERRED raising too (it queues the real
+                // raise on the runloop; catch it before the loop idles).
+                schedule_sibling_pushback_at_idle(ns_window);
             }
         }
         if app_active {
@@ -902,7 +1002,7 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
         // Insurance: if AppKit re-raises the siblings on a later runloop
         // tick, push them back once more.
         tauri::async_runtime::spawn(async move {
-            for delay_ms in [100u64, 300] {
+            for delay_ms in [16u64, 32, 64, 100, 200, 300] {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 if !PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
@@ -914,9 +1014,13 @@ fn focus_panel_macos(app: &AppHandle, window: &tauri::WebviewWindow) {
                         let mut pushed = 0usize;
                         if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
                             if let Ok(ns) = w3.ns_window() {
-                                pushed = unsafe {
-                                    push_siblings_back(ns as *mut objc2::runtime::AnyObject)
+                                let (p, _) = unsafe {
+                                    push_siblings_back(
+                                        ns as *mut objc2::runtime::AnyObject,
+                                        false,
+                                    )
                                 };
+                                pushed = p;
                             }
                         }
                         let _ = tx.send((pushed, key_panel_state(&w3)));
