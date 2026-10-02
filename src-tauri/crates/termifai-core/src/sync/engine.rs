@@ -723,7 +723,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn missing_collection_blob_listed_in_manifest_aborts_sync() {
         let dir = tmp_dir("missing-col-blob");
         let backend = LocalDirBackend::new(&dir);
@@ -731,8 +730,14 @@ mod tests {
         run_sync(&backend, device_a, "hunter2", "default").unwrap();
 
         // مانیفست هنوز hosts رو لیست می‌کنه ولی blob نیست — نباید empty merge بشه
-        let hosts_path = dir.join(CollectionKind::Hosts.file_name());
-        std::fs::remove_file(&hosts_path).unwrap();
+        // content-addressed objects + stable alias must both go, or fetch still succeeds
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("col-hosts") && name.ends_with(".blob") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
 
         let device_b = snapshot("dev-b", vec![host("h2", "other", "2026-01-02T00:00:00Z")]);
         let result = run_sync(&backend, device_b, "hunter2", "default");

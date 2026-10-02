@@ -617,18 +617,16 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
     )
     .map_err(|e| e.to_string())?;
 
-    let dirty_during_sync = crate::sync_auto::dirty_generation() != dirty_gen_at_gather;
-
     let applied = if outcome.local_changed {
-        // اگه وسط sync چیزی ذخیره شده، outcome قدیمی رو روی vault زنده
-        // replace نکن — اول با حالت فعلی دوباره merge کن.
-        if dirty_during_sync {
+        // Rebase when dirty moved during run_sync. apply_outcome LWW-merges into
+        // the live JsonStore under lock so a save racing the write is not wiped.
+        if crate::sync_auto::dirty_generation() != dirty_gen_at_gather {
             outcome = rebase_outcome_on_current_local(
                 app,
                 &outcome,
                 sync_state.sync_ssh_keys,
-                settings,
-                device_id,
+                settings.clone(),
+                device_id.clone(),
                 sync_state.device_name.clone(),
             )?;
         }
@@ -753,12 +751,15 @@ pub fn sync_import_foreign(
     // مثل sync_now از کش واقعی استفاده کن — default خالی تم/شورتکات بقیه دستگاه‌ها رو پاک می‌کنه
     let settings = crate::sync_auto::cache_to_settings(&sync_state.settings_cache);
 
-    let outcome = if request.replace_remote {
+    // Track dirty gen so an edit during the (slow) foreign fetch/store is not
+    // wiped by apply, and so we don't clear dirty while local still diverges.
+    let dirty_gen_at_gather = crate::sync_auto::dirty_generation();
+    let mut outcome = if request.replace_remote {
         // Overwrite remote with this device's own state — no merge.
         let local = gather_local_snapshot(
             app,
             sync_state.sync_ssh_keys,
-            settings,
+            settings.clone(),
             device_id.clone(),
             device_name.clone(),
         )?;
@@ -767,7 +768,7 @@ pub fn sync_import_foreign(
         let local = gather_local_snapshot(
             app,
             sync_state.sync_ssh_keys,
-            settings,
+            settings.clone(),
             device_id.clone(),
             device_name.clone(),
         )?;
@@ -800,7 +801,7 @@ pub fn sync_import_foreign(
         blob_version: manifest.blob_version + 1,
         updated_at: now_iso(),
         device_id: device_id.clone(),
-        device_name,
+        device_name: device_name.clone(),
         kdf: sync::default_kdf_params(),
         sync_salt: sync::b64_encode(&new_salt),
         blob_sha256: sync::sha256_hex(&blob_bytes),
@@ -811,8 +812,19 @@ pub fn sync_import_foreign(
         .store(&new_manifest, &blob_bytes, Some(manifest.blob_version))
         .map_err(|e| e.to_string())?;
 
+    if crate::sync_auto::dirty_generation() != dirty_gen_at_gather {
+        outcome = rebase_outcome_on_current_local(
+            app,
+            &outcome,
+            sync_state.sync_ssh_keys,
+            settings,
+            device_id,
+            device_name,
+        )?;
+    }
     apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
 
+    let still_dirty = crate::sync_auto::dirty_generation() != dirty_gen_at_gather;
     let state = app.state::<AppState>();
     state
         .sync_state_store
@@ -820,7 +832,7 @@ pub fn sync_import_foreign(
             s.backend = Some(request.backend.clone());
             s.last_synced_blob_version = new_manifest.blob_version;
             s.last_sync_at = Some(now_iso());
-            s.dirty = false;
+            s.dirty = still_dirty;
             s.settings_cache = SettingsCache {
                 app_theme: to_cached_blob(outcome.settings.app_theme.clone()),
                 terminal_appearance: to_cached_blob(outcome.settings.terminal_appearance.clone()),
@@ -828,6 +840,10 @@ pub fn sync_import_foreign(
             };
         })
         .map_err(|e| e.to_string())?;
+
+    if still_dirty {
+        crate::sync_auto::note_dirty();
+    }
 
     Ok(())
 }
@@ -1038,7 +1054,10 @@ fn gather_local_snapshot(
     let ssh_keys = if sync_ssh_keys {
         let mut keys = crate::ssh_keys::list_ssh_keys(app)?;
         for key in keys.iter_mut() {
-            key.private_key_pem = crate::ssh_keys::read_private_key_pem(key).ok();
+            // Must not upload metadata without PEM: equal created_at + same
+            // device_id makes LWW prefer local None over a remote key that still
+            // has private material, permanently wiping the sync backup.
+            key.private_key_pem = Some(crate::ssh_keys::read_private_key_pem(key)?);
         }
         Some(keys)
     } else {
@@ -1065,6 +1084,11 @@ fn gather_local_snapshot(
 /// plaintext passwords with the local DEK only when the secret changed),
 /// groups, snippets (including `.sh` bodies), port forwards, SSH keys
 /// (opt-in only), and the merged tombstone list.
+///
+/// Hosts/groups/port-forwards/snippets are LWW-merged into the *live* store
+/// under each `JsonStore` lock (not a blind replace), so a concurrent save
+/// that lands after the sync snapshot was taken cannot be clobbered by stale
+/// apply data. Tombstones from the outcome still delete records sync removed.
 fn apply_outcome(
     app: &AppHandle,
     outcome: &SyncOutcome,
@@ -1103,11 +1127,31 @@ fn apply_outcome(
 
     let state = app.state::<AppState>();
     let groups = outcome.groups.clone();
+    let tombstones = outcome.tombstones.clone();
+    // Prefer live local on equal timestamps (local_device_id >= remote_device_id).
+    const APPLY_LOCAL: &str = "apply-local";
+    const APPLY_OUTCOME: &str = "apply-from-sync";
     state
         .hosts_store
         .update_with_migration(termifai_core::model::hosts::migrate_hosts_vault, |vault| {
-            vault.hosts = hosts.clone();
-            vault.groups = groups.clone();
+            let live_hosts = std::mem::take(&mut vault.hosts);
+            let live_groups = std::mem::take(&mut vault.groups);
+            vault.hosts = sync::merge::merge_entities(
+                live_hosts,
+                hosts.clone(),
+                &tombstones,
+                termifai_core::model::tombstones::EntityKind::Host,
+                APPLY_LOCAL,
+                APPLY_OUTCOME,
+            );
+            vault.groups = sync::merge::merge_entities(
+                live_groups,
+                groups.clone(),
+                &tombstones,
+                termifai_core::model::tombstones::EntityKind::Group,
+                APPLY_LOCAL,
+                APPLY_OUTCOME,
+            );
         })
         .map_err(|e| e.to_string())?;
 
@@ -1115,6 +1159,7 @@ fn apply_outcome(
         app,
         outcome.snippets.clone(),
         outcome.snippet_groups.clone(),
+        outcome.tombstones.clone(),
     )?;
 
     let port_forwards = outcome.port_forwards.clone();
@@ -1123,7 +1168,15 @@ fn apply_outcome(
         .update_with_migration(
             termifai_core::model::forwards::migrate_port_forward_vault,
             |vault| {
-                vault.rules = port_forwards.clone();
+                let live = std::mem::take(&mut vault.rules);
+                vault.rules = sync::merge::merge_entities(
+                    live,
+                    port_forwards.clone(),
+                    &tombstones,
+                    termifai_core::model::tombstones::EntityKind::PortForward,
+                    APPLY_LOCAL,
+                    APPLY_OUTCOME,
+                );
             },
         )
         .map_err(|e| e.to_string())?;

@@ -592,6 +592,29 @@ impl SftpEntry {
             .and_then(|s| s.size);
 
         let identity_ok = upload_marker_matches(local_path, remote_path, total_bytes, local_mtime);
+        let remote_tmp = format!("{}.termifai-uploading", remote_path);
+
+        // Prefer promoting a complete leftover temp *before* resume-offset logic.
+        // After a failed promote with backup restore, dest may look "complete"
+        // (same size) while the new bytes still sit in `.termifai-uploading` —
+        // treating that as resume_at==total would clear the marker and drop the
+        // new copy. Same for dest gone + temp only (legacy unlink-then-rename).
+        let tmp_size = sftp
+            .stat(std::path::Path::new(&remote_tmp))
+            .ok()
+            .and_then(|s| s.size);
+        if identity_ok && is_complete_upload_temp(tmp_size, total_bytes) {
+            promote_upload_temp(&sftp, remote_path, &remote_tmp, remote_len.is_some())?;
+            clear_upload_marker(local_path);
+            on_progress(TransferProgress {
+                session_id: session_id.to_string(),
+                file_name: pathbase(local_path),
+                bytes_transferred: total_bytes,
+                total_bytes,
+            });
+            return Ok(());
+        }
+
         let resume_at =
             upload_resume_offset_verified(remote_len, total_bytes, identity_ok).unwrap_or(0);
 
@@ -610,7 +633,6 @@ impl SftpEntry {
             std::fs::File::open(local_path).map_err(|e| format!("open local: {}", e))?;
 
         // آپلود تازه (غیر resume) اول می‌ره تو فایل موقت تا مقصد قبلی از بین نره
-        let remote_tmp = format!("{}.termifai-uploading", remote_path);
         let using_temp = resume_at == 0;
 
         let mut remote_file = if resume_at > 0 {
@@ -630,7 +652,7 @@ impl SftpEntry {
                 .map_err(|e| format!("seek local: {}", e))?;
             f
         } else {
-            // اگه از آپلود قبلی یه temp مونده، بنداز دور و از صفر بساز
+            // Incomplete leftover temp from a prior attempt — discard and rewrite.
             let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
             clear_upload_marker(local_path);
             sftp.create(std::path::Path::new(&remote_tmp))
@@ -704,31 +726,24 @@ impl SftpEntry {
             return Err(err);
         }
 
-        if using_temp {
-            // حالا که فایل کامل تو temp هست، مقصد قدیمی رو بردار و atomic-ish جایگزین کن
-            if remote_len.is_some() {
-                let _ = sftp.unlink(std::path::Path::new(remote_path));
+        // Incomplete (local truncated mid-transfer) must fail *before* promote —
+        // otherwise we replace a good remote with a short file and then error.
+        if !should_promote_upload(total_bytes, bytes_transferred) {
+            if using_temp {
+                let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
+                clear_upload_marker(local_path);
             }
-            sftp.rename(
-                std::path::Path::new(&remote_tmp),
-                std::path::Path::new(remote_path),
-                None,
-            )
-            .map_err(|e| {
-                // اگه rename ترکید، حداقل temp رو نگه می‌داریم تا بشه دستی نجات داد
-                format!(
-                    "promote upload temp '{}' -> '{}': {}",
-                    remote_tmp, remote_path, e
-                )
-            })?;
-        }
-
-        // فایل local وسط آپلود truncate شده باشه، EOF زودرس می‌آد — موفقیت دروغین نده.
-        if total_bytes > 0 && bytes_transferred != total_bytes {
             return Err(format!(
                 "incomplete upload: wrote {} of {} bytes",
                 bytes_transferred, total_bytes
             ));
+        }
+
+        if using_temp {
+            // Never unlink dest before temp is in place: a network blip between
+            // unlink and rename used to leave only `.termifai-uploading`, and
+            // auto-retry then deleted that temp on restart (remote data loss).
+            promote_upload_temp(&sftp, remote_path, &remote_tmp, remote_len.is_some())?;
         }
 
         clear_upload_marker(local_path);
@@ -1370,6 +1385,73 @@ fn pathbase(path: &str) -> String {
         .to_string()
 }
 
+/// Before promote: transferred bytes must match the size we opened with.
+/// `total_bytes == 0` (empty file) is allowed.
+fn should_promote_upload(total_bytes: u64, bytes_transferred: u64) -> bool {
+    total_bytes == 0 || bytes_transferred == total_bytes
+}
+
+fn is_complete_upload_temp(tmp_size: Option<u64>, total_bytes: u64) -> bool {
+    match tmp_size {
+        Some(n) if n == total_bytes => true,
+        _ => false,
+    }
+}
+
+fn upload_backup_path(remote_path: &str) -> String {
+    format!("{remote_path}.termifai-bak")
+}
+
+/// Replace `remote_path` with a completed temp via backup swap — never unlink dest
+/// first. If renaming temp onto dest fails, restore dest from the backup when we
+/// moved it aside so auto-retry cannot destroy the only remaining copy.
+fn promote_upload_temp(
+    sftp: &ssh2::Sftp,
+    remote_path: &str,
+    remote_tmp: &str,
+    dest_existed: bool,
+) -> Result<(), String> {
+    let backup = upload_backup_path(remote_path);
+    // Stale backup from a prior crashed promote — only remove once the new dest is live.
+    if !dest_existed {
+        // Dest missing (e.g. old unlink-then-rename bug). Prefer promoting temp;
+        // keep any leftover backup until success so we can still restore if rename fails.
+    } else {
+        let _ = sftp.unlink(std::path::Path::new(&backup));
+        sftp.rename(
+            std::path::Path::new(remote_path),
+            std::path::Path::new(&backup),
+            None,
+        )
+        .map_err(|e| {
+            format!(
+                "promote upload temp '{}': park existing '{}': {}",
+                remote_tmp, remote_path, e
+            )
+        })?;
+    }
+
+    if let Err(e) = sftp.rename(
+        std::path::Path::new(remote_tmp),
+        std::path::Path::new(remote_path),
+        None,
+    ) {
+        // Restore previous bytes from backup whenever present (this attempt or leftover).
+        let _ = sftp.rename(
+            std::path::Path::new(&backup),
+            std::path::Path::new(remote_path),
+            None,
+        );
+        return Err(format!(
+            "promote upload temp '{}' -> '{}': {}",
+            remote_tmp, remote_path, e
+        ));
+    }
+
+    let _ = sftp.unlink(std::path::Path::new(&backup));
+    Ok(())
+}
+
 /// اسم فایل temp برای Open remote رو از path traversal و متاکاراکترهای
 /// خطرناک (مخصوصاً `cmd.exe` روی ویندوز مثل `&` و `|`) پاک می‌کنه.
 fn sanitize_open_basename(name: &str) -> String {
@@ -1791,6 +1873,28 @@ mod tests {
         let tmp = format!("{}.termifai-uploading", remote);
         assert_eq!(tmp, "/var/data/config.json.termifai-uploading");
         assert_ne!(tmp, remote);
+        assert_eq!(
+            upload_backup_path(remote),
+            "/var/data/config.json.termifai-bak"
+        );
+    }
+
+    #[test]
+    fn incomplete_upload_must_block_before_promote() {
+        assert!(should_promote_upload(100, 100));
+        assert!(!should_promote_upload(100, 40));
+        assert!(!should_promote_upload(100, 0));
+        assert!(should_promote_upload(0, 0));
+    }
+
+    #[test]
+    fn complete_upload_temp_is_recoverable_on_retry() {
+        // Auto-retry must recognize a finished temp left after a failed promote
+        // instead of unlinking it (which destroyed the only remote copy).
+        assert!(is_complete_upload_temp(Some(4096), 4096));
+        assert!(is_complete_upload_temp(Some(0), 0));
+        assert!(!is_complete_upload_temp(Some(100), 4096));
+        assert!(!is_complete_upload_temp(None, 4096));
     }
 
     #[test]
