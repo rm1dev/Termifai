@@ -623,11 +623,15 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
         // اگه وسط sync چیزی ذخیره شده، outcome قدیمی رو روی vault زنده
         // replace نکن — اول با حالت فعلی دوباره merge کن.
         if dirty_during_sync {
+            // Settings must come from the *live* cache — the gather-time
+            // `settings` snapshot would drop theme/shortcut edits that landed
+            // via cache_settings while run_sync was in flight.
+            let live_settings = live_settings_from_cache(app)?;
             outcome = rebase_outcome_on_current_local(
                 app,
                 &outcome,
                 sync_state.sync_ssh_keys,
-                settings,
+                live_settings,
                 device_id,
                 sync_state.device_name.clone(),
             )?;
@@ -637,6 +641,16 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
     } else {
         false
     };
+
+    // Always re-merge settings against the live cache before persisting.
+    // End-of-sync used to assign outcome.settings (from gather-time) blindly,
+    // wiping cache_settings edits made during the run and then auto-sync would
+    // re-upload the stale theme/shortcuts.
+    let final_settings = sync::merge_settings(
+        &live_settings_from_cache(app)?,
+        &outcome.settings,
+    );
+    outcome.settings = final_settings;
 
     let blob_version = outcome.blob_version;
     let result = SyncNowResult {
@@ -753,7 +767,7 @@ pub fn sync_import_foreign(
     // مثل sync_now از کش واقعی استفاده کن — default خالی تم/شورتکات بقیه دستگاه‌ها رو پاک می‌کنه
     let settings = crate::sync_auto::cache_to_settings(&sync_state.settings_cache);
 
-    let outcome = if request.replace_remote {
+    let mut outcome = if request.replace_remote {
         // Overwrite remote with this device's own state — no merge.
         let local = gather_local_snapshot(
             app,
@@ -773,6 +787,13 @@ pub fn sync_import_foreign(
         )?;
         sync::merge_snapshot(&local, Some(foreign_payload))
     };
+
+    // Preserve theme/shortcut edits that landed in the cache during import —
+    // end-of-import used to assign outcome.settings blindly and wipe them.
+    outcome.settings = sync::merge_settings(
+        &live_settings_from_cache(app)?,
+        &outcome.settings,
+    );
 
     // اول remote رو بنویس، بعد local — اگه store بخوره local دست‌نخورده می‌مونه
     let new_salt = sync::random_sync_salt();
@@ -980,6 +1001,17 @@ fn build_backend(
     }
 }
 
+/// Settings currently in `sync_state.settings_cache` (may be newer than the
+/// snapshot gathered at the start of a sync cycle).
+fn live_settings_from_cache(app: &AppHandle) -> Result<SettingsPayload, String> {
+    let state = app.state::<AppState>();
+    let s = state
+        .sync_state_store
+        .load_with_migration(migrate_sync_state)
+        .map_err(|e| e.to_string())?;
+    Ok(crate::sync_auto::cache_to_settings(&s.settings_cache))
+}
+
 /// Re-merge a sync outcome against the live local vault so saves that landed
 /// while `run_sync` was in flight are not wiped by a full-store replace.
 fn rebase_outcome_on_current_local(
@@ -1046,6 +1078,21 @@ fn gather_local_snapshot(
     };
 
     let snippets_result = crate::snippets::list_snippets(app)?;
+    // Same hazard as SSH PEM: Script metadata with a missing/unreadable `.sh`
+    // gathers as script=None. Whole-entity LWW then uploads None and wipes the
+    // remote body. Abort gather so sync cannot destroy the backup.
+    for snippet in &snippets_result.snippets {
+        if matches!(
+            snippet.kind,
+            termifai_core::model::snippets::SnippetKind::Script
+        ) && snippet.script.is_none()
+        {
+            return Err(format!(
+                "Script snippet '{}' is missing its .sh body — refusing to sync",
+                snippet.id
+            ));
+        }
+    }
 
     Ok(LocalSnapshot {
         hosts,
@@ -1071,7 +1118,11 @@ fn apply_outcome(
     sync_ssh_keys: bool,
 ) -> Result<(), String> {
     let existing_hosts = crate::hosts::list_hosts(app)?.hosts;
-    let mut hosts = outcome.hosts.clone();
+    // Drop (or refuse to overwrite with) hosts whose user/hostname would inject
+    // OpenSSH CLI options. Save-time validation already rejects these, but sync
+    // can still deliver them from another device / a poisoned sync folder.
+    let mut hosts =
+        crate::hosts::filter_synced_ssh_hosts(&outcome.hosts, &existing_hosts);
     for host in hosts.iter_mut() {
         if let Some(plaintext) = host.password.take() {
             if plaintext.is_empty() {

@@ -426,6 +426,41 @@ pub fn upload_resume_offset_verified(
     upload_resume_offset(remote_len, total_bytes)
 }
 
+/// برنامه‌ی ادامه‌ی آپلود روی `.termifai-uploading` — هیچ‌وقت سایز مقصد نهایی
+/// رو به‌عنوان resume offset استفاده نکن (مقصد ممکنه هنوز فایل قدیمی overwrite باشه).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadTempPlan {
+    /// temp کامل نوشته شده؛ فقط promote کن.
+    PromoteComplete,
+    /// به temp ناقص از این offset ادامه بده.
+    ResumeTemp { offset: u64 },
+    /// temp قبلی رو دور بریز و از صفر بنویس.
+    FreshTemp,
+}
+
+pub fn plan_upload_temp(
+    identity_ok: bool,
+    tmp_len: Option<u64>,
+    total_bytes: u64,
+) -> UploadTempPlan {
+    if !identity_ok {
+        return UploadTempPlan::FreshTemp;
+    }
+    match tmp_len {
+        Some(n) if n == total_bytes => UploadTempPlan::PromoteComplete,
+        Some(n) if n > 0 && n < total_bytes => UploadTempPlan::ResumeTemp { offset: n },
+        _ => UploadTempPlan::FreshTemp,
+    }
+}
+
+/// سایز sidecar آپلود (نه مقصد) نشون می‌ده این ادامه‌ی transfer خودمونه.
+pub fn upload_temp_is_our_partial(tmp_len: Option<u64>, total_bytes: u64) -> bool {
+    matches!(
+        plan_upload_temp(true, tmp_len, total_bytes),
+        UploadTempPlan::PromoteComplete | UploadTempPlan::ResumeTemp { .. }
+    )
+}
+
 /// فایل هم‌اندازه فقط وقتی mtime هم بخونه «کامل» حساب می‌شه.
 pub fn same_file_identity(
     size_a: u64,
@@ -526,6 +561,38 @@ mod tests {
             upload_resume_offset_verified(Some(200), 500, true),
             Some(200)
         );
+    }
+
+    #[test]
+    fn upload_temp_plan_ignores_destination_sized_partials() {
+        // Crash mid-overwrite: dest still holds the old smaller file, temp has
+        // the real partial. Planning must key off temp — never dest length.
+        let dest_looks_partial = Some(100u64); // old remote size
+        let tmp_partial = Some(40u64);
+        let total = 1000u64;
+        assert_eq!(
+            plan_upload_temp(true, tmp_partial, total),
+            UploadTempPlan::ResumeTemp { offset: 40 }
+        );
+        // Even if someone mistakenly passed dest size as tmp_len with no temp,
+        // FreshTemp when identity is false; with identity+no temp → FreshTemp.
+        assert_eq!(
+            plan_upload_temp(true, None, total),
+            UploadTempPlan::FreshTemp
+        );
+        let _ = dest_looks_partial;
+        assert_eq!(
+            plan_upload_temp(true, Some(total), total),
+            UploadTempPlan::PromoteComplete
+        );
+        assert_eq!(
+            plan_upload_temp(false, tmp_partial, total),
+            UploadTempPlan::FreshTemp
+        );
+        assert!(upload_temp_is_our_partial(Some(40), 1000));
+        assert!(upload_temp_is_our_partial(Some(1000), 1000));
+        assert!(!upload_temp_is_our_partial(None, 1000));
+        assert!(!upload_temp_is_our_partial(Some(0), 1000));
     }
 
     #[test]

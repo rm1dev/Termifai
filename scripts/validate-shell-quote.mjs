@@ -41,4 +41,25 @@ assert(
 assert(buildCdPart(undefined) === "", "missing working dir yields empty cdPart");
 assert(buildCdPart("   ") === "", "whitespace-only working dir yields empty cdPart");
 
+/** Mirrors src/lib/shell-quote.ts `sshCliDestination`. */
+function sshCliDestination(user, hostname) {
+  return `-- ${posixShellQuote(`${user}@${hostname}`)}`;
+}
+
+const dest = sshCliDestination("ubuntu", "example.com");
+assert(dest.startsWith("-- "), "destination must start with --");
+assert(
+  dest === `-- ${posixShellQuote("ubuntu@example.com")}`,
+  `unexpected destination: ${dest}`
+);
+
+const injectedUser = "-oProxyCommand=touch /tmp/pwned";
+const injected = sshCliDestination(injectedUser, "127.0.0.1");
+assert(injected.startsWith("-- "), "leading-dash user still gets -- prefix");
+assert(
+  injected.includes(posixShellQuote(`${injectedUser}@127.0.0.1`)),
+  "leading-dash user must be inside the quoted destination"
+);
+assert(!injected.startsWith("-o"), "must not expose bare -o before --");
+
 console.log("validate-shell-quote: ok");
